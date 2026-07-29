@@ -248,7 +248,13 @@ def register_person_tools(
             Statuses: pending, already_connected, follow_only,
             connect_unavailable, unavailable, send_failed,
             note_not_supported, custom_note_limit_reached,
-            connected, or accepted.
+            manual_send_required, connected, or accepted.
+
+            When status is ``manual_send_required`` LinkedIn opened the
+            invite dialog but gated submission on the recipient's email
+            address, which only the account owner can supply. Nothing was
+            sent and no state changed; queue the person for a manual
+            invitation rather than retrying.
 
             When status is ``custom_note_limit_reached`` LinkedIn rejected
             personalized invite notes because the free note quota for the
