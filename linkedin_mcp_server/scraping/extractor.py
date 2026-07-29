@@ -2605,6 +2605,40 @@ class LinkedInExtractor:
                     "request; refusing to click Accept.",
                     profile=page_text,
                 )
+            # Second fail-closed gate, on caller intent rather than DOM shape.
+            #
+            # The More-menu disproof above only clears cards that expose an
+            # invite anchor. A creator-mode card that matches the fingerprint
+            # AND has no anchor under More reaches here having disproved
+            # nothing, and the Accept click below lands on its first labeled
+            # button — Follow. Observed live 2026-07-29 (gal-melamed-2286221):
+            # the caller asked to send an invitation with a note and instead
+            # followed him, reported as send_failed.
+            #
+            # A caller that supplies a note has stated its intent: send an
+            # invitation. Accepting an incoming request is a different action
+            # with a different outcome, and it is never what a note-bearing
+            # call wanted. So when the disproof came back empty and a note is
+            # present, refuse rather than guess. This costs a genuine incoming
+            # request nothing but a manual accept; guessing wrong costs an
+            # unintended, user-visible write on someone else's profile.
+            if note:
+                logger.info(
+                    "Disproof found no invite anchor for %s and a note was "
+                    "requested; refusing to click Accept on a possible "
+                    "misclassification",
+                    username,
+                )
+                return _connection_result(
+                    url,
+                    "send_failed",
+                    "Could not confirm this is an incoming request and a note "
+                    "was requested; refusing to click Accept. If this profile "
+                    "really has a pending invitation from them, accept it "
+                    "manually.",
+                    note_sent=False,
+                    profile=page_text,
+                )
             # Accept clicks the first labeled button in the fingerprinted
             # row. There is deliberately no locale-text fallback: clicking
             # a button matched by exact text anywhere in the page risks
