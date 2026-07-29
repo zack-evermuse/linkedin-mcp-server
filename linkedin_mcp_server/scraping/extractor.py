@@ -500,10 +500,19 @@ function findActionRoot(main) {
 # aria-label); the unlabeled-expander check excludes player settings
 # expanders (the profile More button never carries aria-label); the
 # DOM-order guard excludes bars with trailing labeled buttons; the
-# compose/invite/labeled-anchor exclusions kill follow_only, pending,
-# connected top cards and sidebar cards. The scan continues over ALL
-# expander candidates because cover-video profiles render the player's
-# expander before the top-card row in DOM order.
+# compose/invite/labeled-anchor exclusions kill pending, connected top
+# cards and sidebar cards. The scan continues over ALL expander candidates
+# because cover-video profiles render the player's expander before the
+# top-card row in DOM order.
+#
+# NOT excluded: creator-mode / high-follower cards that render
+# [Follow][Save in Sales Navigator][More] with no Message button and
+# Connect demoted into the More menu. They satisfy every guard above, so
+# this fingerprint alone is NOT sufficient evidence of an incoming
+# request — connect_with_person must disprove it via the More-menu invite
+# probe before clicking Accept. Do not delete that probe on the grounds
+# that the exclusions here look exhaustive; they are not (marc-banoub,
+# 2026-07-29, where the first labeled button was Follow).
 #
 # The search is scoped to the top card — the first <section> of <main>
 # (falling back to main's first child, then main). Profile pages render
@@ -673,6 +682,34 @@ _CLICK_INCOMING_ACCEPT_JS = (
   const row = findIncomingActionRow(main);
   if (!row) return false;
   row.querySelectorAll('button[aria-label]')[0].click();
+  return true;
+})
+"""
+)
+
+# Open the More menu of the *fingerprinted incoming-request row*, rather
+# than of the compose-anchor action root.
+#
+# This deliberately does NOT reuse _OPEN_MORE_BUTTON_JS. That helper walks
+# up from a /messaging/compose/ anchor (findActionRoot), and the profiles
+# that produce the incoming-request false positive are exactly the ones
+# with no Message button in the top card — so findActionRoot returns null
+# there and the menu would never open. The fingerprint already guarantees
+# the row contains exactly one button[aria-expanded]; clicking that is the
+# only reliable way to reach the menu on these cards.
+_OPEN_INCOMING_ROW_MORE_BUTTON_JS = (
+    r"""
+(() => {
+"""
+    + _FIND_INCOMING_ACTION_ROW_FN_JS
+    + r"""
+  const main = document.querySelector('main');
+  if (!main) return false;
+  const row = findIncomingActionRow(main);
+  if (!row) return false;
+  const moreBtn = row.querySelector('button[aria-expanded]');
+  if (!moreBtn) return false;
+  moreBtn.click();
   return true;
 })
 """
@@ -1455,6 +1492,33 @@ class LinkedInExtractor:
             return True
         except PlaywrightTimeoutError:
             logger.debug("More menu did not appear after click")
+            return False
+
+    async def _open_incoming_row_more_menu(self) -> bool:
+        """Open the More menu of the fingerprinted incoming-request row.
+
+        Same contract as ``_open_more_menu`` (True iff the click landed and
+        a ``[role='menu']`` became visible), but anchored on the incoming
+        row's own ``button[aria-expanded]`` instead of the compose-anchor
+        action root. ``_open_more_menu`` cannot be used here: it locates the
+        More button via ``findActionRoot``, which walks up from a
+        ``/messaging/compose/`` anchor, and the creator-mode cards that
+        trip the incoming-request fingerprint render no Message button at
+        all — so it would return False on exactly the profiles this probe
+        exists to disambiguate.
+        """
+        try:
+            clicked = await self._page.evaluate(_OPEN_INCOMING_ROW_MORE_BUTTON_JS)
+        except Exception:
+            logger.debug("Incoming-row More click via JS failed", exc_info=True)
+            return False
+        if not clicked:
+            return False
+        try:
+            await self._page.wait_for_selector("[role='menu']", timeout=3000)
+            return True
+        except PlaywrightTimeoutError:
+            logger.debug("Incoming-row More menu did not appear after click")
             return False
 
     async def _click_incoming_accept(self) -> bool:
@@ -2478,6 +2542,69 @@ class LinkedInExtractor:
             )
 
         if state == "incoming_request":
+            # Disprove the classification before acting on it.
+            #
+            # The fingerprint is not unique to incoming requests. A
+            # creator-mode / high-follower card renders exactly
+            #   [button aria-label -> Follow]
+            #   [button aria-label -> Save in Sales Navigator]
+            #   [button aria-expanded, unlabeled -> More]
+            # with no Message button (so no compose anchor to exclude it)
+            # and Connect demoted into the More menu (so no invite anchor
+            # until that menu is opened). Every exclusion in
+            # _FIND_INCOMING_ACTION_ROW_FN_JS passes and the shape matches,
+            # so _click_incoming_accept clicks the first labeled button —
+            # Follow. That is an unintended, user-visible write on a
+            # profile the user only meant to invite, and it is reported as
+            # send_failed because the card never reaches 1st-degree.
+            # Observed live 2026-07-29 (marc-banoub): the run followed him
+            # and created no invitation.
+            #
+            # A Connect action and an invitation pending *from* that person
+            # are mutually exclusive, so a vanityName invite anchor
+            # surfacing under More is a decisive, locale-independent
+            # disproof of incoming_request. Note these cards can never be
+            # rescued by the follow_only More retry below: follow_only
+            # requires a compose anchor in the action root, which they do
+            # not have.
+            probe_opened = await self._open_incoming_row_more_menu()
+            if probe_opened:
+                probed = await self._read_action_signals(username)
+                # Close the menu before clicking Accept or navigating, so
+                # the overlay cannot intercept either.
+                try:
+                    await self._page.keyboard.press("Escape")
+                except Exception:
+                    logger.debug(
+                        "Escape after incoming More-menu probe failed", exc_info=True
+                    )
+                logger.info(
+                    "Post-More incoming probe for %s: signals=%s", username, probed
+                )
+                if probed.has_invite_anchor:
+                    logger.info(
+                        "Invite anchor found under More for %s; reclassifying "
+                        "incoming_request -> connectable",
+                        username,
+                    )
+                    signals = probed
+                    state = "connectable"
+
+        if state == "incoming_request":
+            # Fail closed when the disproof could not run. The fingerprint
+            # guarantees the row holds exactly one button[aria-expanded],
+            # so a menu that refuses to open is anomalous — and Accept is
+            # irreversible while a missed accept is not. Report send_failed
+            # and let the user accept manually rather than risk clicking
+            # Follow on a misclassified card.
+            if not probe_opened:
+                return _connection_result(
+                    url,
+                    "send_failed",
+                    "Could not open the More menu to confirm this is an incoming "
+                    "request; refusing to click Accept.",
+                    profile=page_text,
+                )
             # Accept clicks the first labeled button in the fingerprinted
             # row. There is deliberately no locale-text fallback: clicking
             # a button matched by exact text anywhere in the page risks

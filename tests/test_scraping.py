@@ -2580,8 +2580,17 @@ class TestConnectWithPerson:
                 new_callable=AsyncMock,
                 side_effect=[
                     self._signals(incoming_row=True),
+                    # More-menu disproof probe: a genuine incoming request
+                    # exposes no Connect action, so no invite anchor.
+                    self._signals(incoming_row=True),
                     self._signals(compose=True),
                 ],
+            ),
+            patch.object(
+                extractor,
+                "_open_incoming_row_more_menu",
+                new_callable=AsyncMock,
+                return_value=True,
             ),
             patch.object(
                 extractor,
@@ -2624,6 +2633,12 @@ class TestConnectWithPerson:
                 "_read_action_signals",
                 new_callable=AsyncMock,
                 return_value=self._signals(incoming_row=True),
+            ),
+            patch.object(
+                extractor,
+                "_open_incoming_row_more_menu",
+                new_callable=AsyncMock,
+                return_value=True,
             ),
             patch.object(
                 extractor,
@@ -2674,6 +2689,12 @@ class TestConnectWithPerson:
             ),
             patch.object(
                 extractor,
+                "_open_incoming_row_more_menu",
+                new_callable=AsyncMock,
+                return_value=True,
+            ),
+            patch.object(
+                extractor,
                 "_click_incoming_accept",
                 new_callable=AsyncMock,
                 return_value=True,
@@ -2714,9 +2735,17 @@ class TestConnectWithPerson:
                 new_callable=AsyncMock,
                 side_effect=[
                     self._signals(incoming_row=True),
+                    # More-menu disproof probe.
+                    self._signals(incoming_row=True),
                     self._signals(incoming_row=True),
                     self._signals(compose=True),
                 ],
+            ),
+            patch.object(
+                extractor,
+                "_open_incoming_row_more_menu",
+                new_callable=AsyncMock,
+                return_value=True,
             ),
             patch.object(
                 extractor,
@@ -2733,6 +2762,125 @@ class TestConnectWithPerson:
 
         assert result["status"] == "accepted"
         mock_sleep.assert_awaited_once()
+
+    async def test_incoming_fingerprint_with_invite_under_more_sends_invite(
+        self, mock_page
+    ):
+        """Creator-mode card matching the incoming fingerprint must NOT be
+        accepted: the More-menu probe surfaces the vanityName invite anchor,
+        which disproves incoming_request, so we send via the deeplink instead
+        of clicking the row's first labeled button (Follow).
+
+        Regression: marc-banoub 2026-07-29. The top card renders
+        [Follow][Save in Sales Navigator][More] with no Message button and
+        Connect demoted into More, satisfying every fingerprint exclusion.
+        Before the disproof step this followed the target and reported
+        send_failed.
+        """
+        extractor = LinkedInExtractor(mock_page)
+        pre = "Creator\n\n· 3rd+\n\nNYC\n\nFollow\nSave in Sales Navigator\nMore\n"
+        post = "Creator\n\n· 3rd+\n\nNYC\n\nPending\nMore\n"
+
+        with (
+            patch.object(
+                extractor,
+                "scrape_person",
+                self._mock_scrape(pre, follow_up_text=post),
+            ),
+            patch.object(
+                extractor,
+                "_read_action_signals",
+                new_callable=AsyncMock,
+                side_effect=[
+                    # Initial read: fingerprint matches, no invite anchor yet
+                    # because Connect is hidden in the unopened More menu.
+                    self._signals(incoming_row=True),
+                    # Disproof probe after opening More: the portal-rendered
+                    # invite anchor is now in the document.
+                    self._signals(incoming_row=True, invite=True),
+                    # Post-send verification: invite anchor gone.
+                    self._signals(labeled_anchor=True),
+                ],
+            ),
+            patch.object(
+                extractor,
+                "_open_incoming_row_more_menu",
+                new_callable=AsyncMock,
+                return_value=True,
+            ) as mock_more,
+            patch.object(
+                extractor,
+                "_click_incoming_accept",
+                new_callable=AsyncMock,
+                return_value=True,
+            ) as mock_accept,
+            patch.object(
+                extractor,
+                "_navigate_to_page",
+                new_callable=AsyncMock,
+            ) as mock_nav,
+            patch.object(
+                extractor,
+                "_submit_invite_dialog",
+                new_callable=AsyncMock,
+                return_value=(True, True, None),
+            ) as mock_submit,
+        ):
+            result = await extractor.connect_with_person("testuser", note="hi")
+
+        assert result["status"] == "connected"
+        assert result["note_sent"] is True
+        mock_more.assert_awaited_once()
+        # The irreversible click must never fire on a disproved card.
+        mock_accept.assert_not_awaited()
+        mock_submit.assert_awaited_once()
+        mock_nav.assert_awaited_once()
+        assert "custom-invite" in mock_nav.await_args_list[0].args[0]
+
+    async def test_incoming_request_send_failed_when_more_menu_will_not_open(
+        self, mock_page
+    ):
+        """Fail closed when the disproof probe cannot run.
+
+        The fingerprint guarantees the row holds exactly one
+        button[aria-expanded], so a More menu that refuses to open is
+        anomalous. A missed accept is recoverable by hand; a stray Follow
+        on a misclassified card is not.
+        """
+        extractor = LinkedInExtractor(mock_page)
+        pre = "Eric\n\n· 2.\n\nAachen\n\nAnnehmen\nIgnorieren\nMehr\nInfo\n"
+
+        with (
+            patch.object(extractor, "scrape_person", self._mock_scrape(pre)),
+            patch.object(
+                extractor,
+                "_read_action_signals",
+                new_callable=AsyncMock,
+                return_value=self._signals(incoming_row=True),
+            ),
+            patch.object(
+                extractor,
+                "_open_incoming_row_more_menu",
+                new_callable=AsyncMock,
+                return_value=False,
+            ),
+            patch.object(
+                extractor,
+                "_click_incoming_accept",
+                new_callable=AsyncMock,
+                return_value=True,
+            ) as mock_accept,
+            patch.object(
+                extractor,
+                "_navigate_to_page",
+                new_callable=AsyncMock,
+            ) as mock_nav,
+        ):
+            result = await extractor.connect_with_person("testuser")
+
+        assert result["status"] == "send_failed"
+        mock_accept.assert_not_awaited()
+        mock_nav.assert_not_awaited()
 
     async def test_returns_unavailable_when_no_signals_and_text(self, mock_page):
         """No structural signals, no actionable text → connect_unavailable."""

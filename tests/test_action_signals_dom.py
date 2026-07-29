@@ -25,6 +25,8 @@ from patchright.async_api import async_playwright
 from linkedin_mcp_server.scraping.extractor import (
     _ACTION_SIGNALS_JS,
     _CLICK_INCOMING_ACCEPT_JS,
+    _OPEN_INCOMING_ROW_MORE_BUTTON_JS,
+    _OPEN_MORE_BUTTON_JS,
 )
 
 #: CI uses ``--dist loadgroup``. Keep every test that launches Chromium on one
@@ -149,6 +151,36 @@ EXPANDER_FIRST_BAR = """
 </section>
 """
 
+# Creator-mode / high-follower top card (marc-banoub, 2026-07-29): two
+# labeled buttons plus the unlabeled expander, NO Message anchor, and
+# Connect demoted into the More menu. Shape-identical to the incoming row,
+# so it satisfies the fingerprint — which is exactly the false positive
+# that made connect_with_person click Follow. The inline onclick records
+# which control a click actually landed on.
+CREATOR_MODE_TOP_CARD = """
+<section class="topcard">
+  <h1>Marc Banoub</h1>
+  <div class="actions">
+    <button type="button" aria-label="Marc Banoub folgen"
+      onclick="document.body.setAttribute('data-clicked','follow')">Folgen</button>
+    <button type="button" aria-label="In Sales Navigator speichern"
+      onclick="document.body.setAttribute('data-clicked','save')">Speichern</button>
+    <button type="button" aria-expanded="false"
+      onclick="document.body.setAttribute('data-clicked','more')">Mehr</button>
+  </div>
+</section>
+"""
+
+# LinkedIn renders the opened More menu in a portal outside <main>, which is
+# why hasInvite searches `document` rather than `main`.
+CREATOR_MODE_MORE_MENU_PORTAL = """
+<div role="menu" class="portal">
+  <a href="/preload/custom-invite/?vanityName=testuser">Vernetzen</a>
+  <a href="/messaging/compose/?profileUrn=urn%3Ali%3Afsd_profile%3AEEE">
+    Profil senden</a>
+</div>
+"""
+
 EXTRA_BUTTON_ROW = """
 <section class="hostile">
   <button type="button" aria-label="Aktion A">A</button>
@@ -159,8 +191,8 @@ EXTRA_BUTTON_ROW = """
 """
 
 
-def _page_html(*sections: str) -> str:
-    return f"<html><body><main>{''.join(sections)}</main></body></html>"
+def _page_html(*sections: str, portal: str = "") -> str:
+    return f"<html><body><main>{''.join(sections)}</main>{portal}</body></html>"
 
 
 @pytest.fixture
@@ -256,3 +288,64 @@ class TestClickIncomingAccept:
         await dom_page.set_content(_page_html(FOLLOW_ONLY_TOP_CARD, VIDEO_PLAYER_BAR))
         clicked = await dom_page.evaluate(_CLICK_INCOMING_ACCEPT_JS)
         assert clicked is False
+
+
+class TestCreatorModeFalsePositive:
+    """The fingerprint alone cannot distinguish a creator-mode card from an
+    incoming request; connect_with_person must disprove it via the More menu.
+
+    Regression: marc-banoub 2026-07-29, where the Accept click landed on
+    Follow and the run reported send_failed with no invitation created.
+    """
+
+    async def test_creator_card_matches_the_incoming_fingerprint(self, dom_page):
+        # Documents the false positive rather than asserting it away: every
+        # exclusion passes because there is no Message anchor and Connect is
+        # not in the DOM until More is opened. If a future fingerprint change
+        # makes this False, the disproof probe becomes redundant — but do not
+        # assume that without re-checking a live creator profile.
+        data = await _signals(dom_page, _page_html(CREATOR_MODE_TOP_CARD))
+        assert data["hasIncomingActionRow"] is True
+        assert data["hasInvite"] is False
+
+    async def test_accept_click_would_land_on_follow(self, dom_page):
+        # Why this is a safety bug and not a mere misreport: the click is a
+        # real, user-visible write on the wrong control.
+        await dom_page.set_content(_page_html(CREATOR_MODE_TOP_CARD))
+        clicked = await dom_page.evaluate(_CLICK_INCOMING_ACCEPT_JS)
+        assert clicked is True
+        recorded = await dom_page.evaluate("document.body.getAttribute('data-clicked')")
+        assert recorded == "follow"
+
+    async def test_generic_more_opener_cannot_reach_creator_card(self, dom_page):
+        # The trap: _OPEN_MORE_BUTTON_JS finds More via findActionRoot, which
+        # walks up from a /messaging/compose/ anchor. Creator cards have no
+        # Message button, so it returns false — reusing it for the disproof
+        # probe would make the fix a no-op on exactly these profiles.
+        await dom_page.set_content(_page_html(CREATOR_MODE_TOP_CARD))
+        assert await dom_page.evaluate(_OPEN_MORE_BUTTON_JS) is False
+
+    async def test_row_scoped_more_opener_reaches_creator_card(self, dom_page):
+        await dom_page.set_content(_page_html(CREATOR_MODE_TOP_CARD))
+        assert await dom_page.evaluate(_OPEN_INCOMING_ROW_MORE_BUTTON_JS) is True
+        recorded = await dom_page.evaluate("document.body.getAttribute('data-clicked')")
+        assert recorded == "more"
+
+    async def test_invite_anchor_in_portal_menu_disproves_incoming(self, dom_page):
+        # Post-open state: the menu is portal-rendered outside <main>, and
+        # hasInvite searches `document`, so the vanityName anchor surfaces
+        # and disproves the incoming-request classification.
+        data = await _signals(
+            dom_page,
+            _page_html(CREATOR_MODE_TOP_CARD, portal=CREATOR_MODE_MORE_MENU_PORTAL),
+        )
+        assert data["hasInvite"] is True
+
+    async def test_genuine_incoming_row_exposes_no_invite_anchor(self, dom_page):
+        # The disproof must not fire on real incoming requests: an open More
+        # menu there offers no Connect, so the Accept path still runs.
+        await dom_page.set_content(_page_html(INCOMING_TOP_CARD, SIDEBAR_SECTION))
+        assert await dom_page.evaluate(_OPEN_INCOMING_ROW_MORE_BUTTON_JS) is True
+        data = await dom_page.evaluate(_ACTION_SIGNALS_JS, "testuser")
+        assert data["hasIncomingActionRow"] is True
+        assert data["hasInvite"] is False
