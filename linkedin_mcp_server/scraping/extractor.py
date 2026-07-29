@@ -425,19 +425,61 @@ _CONTENT_SCROLLS_PER_REQUESTED_PAGE = 5
 # LinkedIn accepts "F" (1st-degree), "S" (2nd-degree), "O" (3rd-degree and beyond).
 _NETWORK_TOKENS = ("F", "S", "O")
 
-_DIALOG_SELECTOR = 'dialog[open], [role="dialog"]'
-_DIALOG_PREMIUM_LINK_SELECTOR = (
-    'dialog[open] a[href*="/premium/"], [role="dialog"] a[href*="/premium/"]'
+# Every dialog selector below is scoped to LinkedIn's modal outlet, and that
+# scoping is load-bearing -- not tidiness.
+#
+# `[role="dialog"]` on its own is NOT unique to modals. LinkedIn's messaging
+# overlay renders each open chat bubble as a `[role="dialog"]` inside
+# `ASIDE#msg-overlay`, and those bubbles hydrate about a second after
+# `domcontentloaded`. So on any account with open message threads, an
+# unscoped `dialog[open], [role="dialog"]` matched the invite modal *plus*
+# every chat bubble, and the positional button indexing this module relies on
+# (`nth(count - 1)` for the primary action, `nth(count - 2)` for the
+# secondary) then indexed into a list spanning all of them.
+#
+# Measured live 2026-07-29 on an account with two chat bubbles open:
+#   unscoped:  3 dialogs, 51 buttons -> nth(50) = "Open send options",
+#                                       nth(49) = "Send"  (both belong to a
+#                                       chat bubble, not the invitation)
+#   outlet:    1 dialog,   3 buttons -> nth(2)  = "Send without a note",
+#                                       nth(1)  = "Add a note"  (correct)
+# That is the whole of the "deeplink opens no dialog" defect: the deeplink
+# opens the dialog fine, but Send was clicked in a chat window, the invite
+# modal never closed, and the caller reported connect_unavailable. It looked
+# profile-dependent only because it is really a race with overlay hydration.
+#
+# `aria-modal` is not usable as the discriminator -- LinkedIn does not set it
+# on the invite dialog (verified live). The outlet id is the available
+# structural signal, and it is locale-independent per the AGENTS.md Scraping
+# Rules: an element id, not layout classes and not UI copy. If LinkedIn ever
+# renames it, every helper here reports "no dialog" and callers fail closed
+# with connect_unavailable rather than clicking something unintended --
+# `_dialog_is_open` logs explicitly when that happens.
+_MODAL_OUTLET_SELECTOR = "#artdeco-modal-outlet"
+_DIALOG_SELECTOR = (
+    f'{_MODAL_OUTLET_SELECTOR} dialog[open], {_MODAL_OUTLET_SELECTOR} [role="dialog"]'
 )
-_DIALOG_TEXTAREA_SELECTOR = '[role="dialog"] textarea, dialog textarea'
+_DIALOG_PREMIUM_LINK_SELECTOR = (
+    f'{_MODAL_OUTLET_SELECTOR} dialog[open] a[href*="/premium/"], '
+    f'{_MODAL_OUTLET_SELECTOR} [role="dialog"] a[href*="/premium/"]'
+)
+_DIALOG_TEXTAREA_SELECTOR = (
+    f'{_MODAL_OUTLET_SELECTOR} [role="dialog"] textarea, '
+    f"{_MODAL_OUTLET_SELECTOR} dialog textarea"
+)
 # LinkedIn gates some invitations behind the recipient's email address
 # ("we need to verify you know this person"). Detected by input *type*,
 # which is an HTML attribute value rather than UI copy, so it holds across
 # locales. Only the account owner can answer that prompt, so the tool
 # reports it instead of attempting to satisfy it.
 _DIALOG_EMAIL_INPUT_SELECTOR = (
-    '[role="dialog"] input[type="email"], dialog input[type="email"]'
+    f'{_MODAL_OUTLET_SELECTOR} [role="dialog"] input[type="email"], '
+    f'{_MODAL_OUTLET_SELECTOR} dialog input[type="email"]'
 )
+# Any dialog anywhere, used only to tell "LinkedIn rendered nothing" apart
+# from "LinkedIn rendered a dialog somewhere we no longer recognise". Never
+# use this to click: that is exactly the bug described above.
+_ANY_DIALOG_SELECTOR = 'dialog[open], [role="dialog"]'
 
 _MESSAGING_COMPOSE_LINK_SELECTOR = 'main a[href*="/messaging/compose/"]'
 _MESSAGING_COMPOSE_SELECTOR = (
@@ -672,26 +714,6 @@ _OPEN_MORE_BUTTON_JS = (
 })
 """
 )
-
-# Click the vanityName invite anchor wherever it currently sits — the
-# top-card action bar or an open More-menu overlay. Used as the fallback
-# when the custom-invite deeplink opens no dialog (see
-# connect_with_person). The selector is the same URL pattern the detection
-# path already trusts, scoped to the target's vanityName, so this adds no
-# new locale dependence and cannot match a Connect control belonging to
-# another profile on the page. document scope is required: LinkedIn
-# renders the More menu in a portal outside <main>.
-_CLICK_INVITE_ANCHOR_JS = r"""
-((username) => {
-  const safe = CSS.escape(username);
-  const el = document.querySelector(
-    `a[href*="/preload/custom-invite/?vanityName=${safe}"]`
-  );
-  if (!el) return false;
-  el.click();
-  return true;
-})
-"""
 
 # Click Accept on an incoming-request profile. Accept is the FIRST labeled
 # button in the fingerprinted row — primary actions render first in
@@ -1398,15 +1420,40 @@ class LinkedInExtractor:
             return False
 
     async def _dialog_is_open(self, *, timeout: int = 1000) -> bool:
-        """Return whether a dialog is currently open (structural check)."""
-        locator = self._page.locator(_DIALOG_SELECTOR)
+        """Return whether a modal dialog is currently open (structural check).
+
+        Waits for a *visible* modal to appear rather than sampling the DOM
+        once: the previous implementation returned False immediately when
+        ``count() == 0``, which made the ``timeout`` argument dead for the
+        case it exists to cover -- a dialog that has not rendered yet. The
+        page is navigated with ``wait_until="domcontentloaded"``, so a
+        dialog mounted during hydration could be missed entirely.
+        """
         try:
-            if await locator.count() == 0:
-                return False
-            await locator.first.wait_for(state="visible", timeout=timeout)
+            await self._page.wait_for_selector(
+                _DIALOG_SELECTOR, state="visible", timeout=timeout
+            )
             return True
         except Exception:
-            return False
+            pass
+        # No modal in the outlet. Distinguish "LinkedIn showed nothing" from
+        # "LinkedIn showed a dialog somewhere _MODAL_OUTLET_SELECTOR no
+        # longer covers" -- the second means this module's scoping has gone
+        # stale and every invite will fail closed until it is updated. That
+        # is worth a log line rather than a silent connect_unavailable.
+        try:
+            stray = await self._page.locator(_ANY_DIALOG_SELECTOR).count()
+            if stray:
+                logger.warning(
+                    "No dialog inside %s, but %d dialog(s) exist elsewhere on "
+                    "the page. If invites are failing, LinkedIn may have moved "
+                    "the modal outlet and the selector needs updating.",
+                    _MODAL_OUTLET_SELECTOR,
+                    stray,
+                )
+        except Exception:
+            logger.debug("Stray-dialog diagnostic failed", exc_info=True)
+        return False
 
     async def _click_dialog_primary_button(self, *, timeout: int = 5000) -> bool:
         """Click the last (primary/Send) button in the open dialog.
@@ -1472,13 +1519,14 @@ class LinkedInExtractor:
 
         try:
             message = await self._page.evaluate(
-                """() => {
-                    const link = document.querySelector(
-                        'dialog[open] a[href*="/premium/"], [role="dialog"] a[href*="/premium/"]'
-                    );
+                """(selector) => {
+                    const link = document.querySelector(selector);
                     const dialog = link?.closest('dialog,[role="dialog"]');
                     return dialog?.innerText || dialog?.textContent || link?.innerText || '';
-                }"""
+                }""",
+                # Same outlet-scoped selector the locator above used. Kept as
+                # an argument rather than inlined so the two can never drift.
+                _DIALOG_PREMIUM_LINK_SELECTOR,
             )
             if isinstance(message, str) and message.strip():
                 return message.strip()
@@ -1538,35 +1586,6 @@ class LinkedInExtractor:
         except Exception:
             logger.debug("Email-gate probe failed", exc_info=True)
             return False
-
-    async def _click_invite_anchor(self, username: str) -> bool:
-        """Click the vanityName invite anchor, opening the More menu if needed.
-
-        The custom-invite deeplink is the primary send path, but LinkedIn
-        does not honour it for every profile: on some accounts it lands on
-        a page with no invite dialog at all, while the Connect item in the
-        More menu works normally. Verified live 2026-07-29 against five
-        such profiles (tejaswi-tenneti-78a66116, angelosangelou,
-        johnroa27, sametozkale, sergii-shcherbak-10068866), each of which
-        exposed Connect under More by hand while the deeplink returned no
-        dialog.
-
-        Returns True iff the anchor was found and clicked. The caller is
-        expected to follow with ``_submit_invite_dialog``; this helper
-        deliberately does not wait for or dismiss the dialog.
-        """
-        for attempt in ("direct", "more-menu"):
-            if attempt == "more-menu" and not await self._open_more_menu():
-                return False
-            try:
-                clicked = await self._page.evaluate(_CLICK_INVITE_ANCHOR_JS, username)
-            except Exception:
-                logger.debug("Invite anchor click via JS failed", exc_info=True)
-                return False
-            if clicked:
-                logger.info("Clicked invite anchor for %s (%s)", username, attempt)
-                return True
-        return False
 
     async def _open_incoming_row_more_menu(self) -> bool:
         """Open the More menu of the fingerprinted incoming-request row.
@@ -2824,33 +2843,16 @@ class LinkedInExtractor:
                 profile=page_text,
             )
         if not submitted:
-            # The deeplink is not universally honoured. On some profiles it
-            # renders no invite dialog even though the Connect control in the
-            # More menu works by hand — five such profiles verified live
-            # 2026-07-29. Fall back to clicking the anchor itself, which is
-            # the same URL the write-gate already matched on, so this widens
-            # the send path without widening what we are willing to click.
-            logger.info(
-                "Deeplink opened no invite dialog for %s; falling back to "
-                "clicking the invite anchor",
-                username,
-            )
-            await self._navigate_to_page(url)
-            if await self._click_invite_anchor(username):
-                (
-                    submitted,
-                    note_sent,
-                    note_limit_message,
-                ) = await self._submit_invite_dialog(note)
-                if note_limit_message is not None:
-                    return _connection_result(
-                        url,
-                        "custom_note_limit_reached",
-                        note_limit_message,
-                        note_sent=False,
-                        profile=page_text,
-                    )
-        if not submitted:
+            # There is deliberately no "click the Connect anchor instead"
+            # fallback here. One was added in 42b93f0 on the theory that
+            # LinkedIn does not honour the deeplink for some profiles; it
+            # never worked, and the theory was wrong. The deeplink opens the
+            # invite modal reliably -- what failed was clicking Send, because
+            # the dialog selector also matched the messaging overlay's chat
+            # bubbles (see _MODAL_OUTLET_SELECTOR). Re-adding an anchor-click
+            # path would not have fixed that and would only add another
+            # unaudited click to the write path.
+            #
             # Distinguish "LinkedIn wants more from the human" from a plain
             # failure: some profiles gate the invite behind an email-address
             # field that only the account owner can answer (angelosangelou,

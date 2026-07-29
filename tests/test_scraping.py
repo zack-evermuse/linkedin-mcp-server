@@ -30,6 +30,11 @@ from linkedin_mcp_server.scraping.extractor import (
     ExtractedSection,
     LinkedInExtractor,
     _CONTENT_DATE_POSTED_MAP,
+    _DIALOG_EMAIL_INPUT_SELECTOR,
+    _DIALOG_PREMIUM_LINK_SELECTOR,
+    _DIALOG_SELECTOR,
+    _DIALOG_TEXTAREA_SELECTOR,
+    _MODAL_OUTLET_SELECTOR,
     _RATE_LIMITED_MSG,
     _build_feed_references,
     _truncate_linkedin_noise,
@@ -2166,10 +2171,45 @@ class TestConnectWithPerson:
             result
             == "Wysyłaj nieograniczoną liczbę spersonalizowanych zaproszeń dzięki Premium"
         )
-        mock_page.locator.assert_called_once_with(
-            'dialog[open] a[href*="/premium/"], [role="dialog"] a[href*="/premium/"]'
-        )
+        # Assert against the constant, not a copy of its value: the previous
+        # hardcoded literal silently encoded the unscoped selector that let
+        # the messaging overlay's chat bubbles match as invite dialogs.
+        mock_page.locator.assert_called_once_with(_DIALOG_PREMIUM_LINK_SELECTOR)
+        assert _MODAL_OUTLET_SELECTOR in _DIALOG_PREMIUM_LINK_SELECTOR
         premium_link.wait_for.assert_awaited_once_with(state="visible", timeout=1234)
+
+    def test_every_dialog_selector_is_scoped_to_the_modal_outlet(self):
+        """Dialog selectors must never match outside LinkedIn's modal outlet.
+
+        `[role="dialog"]` is not unique to modals: LinkedIn's messaging
+        overlay renders every open chat bubble with that role. An unscoped
+        selector therefore matched the invite modal plus each chat bubble,
+        and the positional button indexing in `_submit_invite_dialog`
+        (`nth(count - 1)` primary, `nth(count - 2)` secondary) indexed into
+        the combined list. Measured live 2026-07-29 with two chat bubbles
+        open: 51 buttons instead of 3, with `nth(count - 1)` landing on a
+        chat window's "Open send options" and `nth(count - 2)` on its
+        "Send". That is the "deeplink opens no dialog" defect, and it also
+        put a real message-send control on the invite write path.
+
+        This is a guard against re-simplifying the scoping away. Each
+        comma-separated branch must carry the outlet prefix -- prefixing
+        only the first branch reopens the bug for the second.
+        """
+        for name, selector in (
+            ("_DIALOG_SELECTOR", _DIALOG_SELECTOR),
+            ("_DIALOG_PREMIUM_LINK_SELECTOR", _DIALOG_PREMIUM_LINK_SELECTOR),
+            ("_DIALOG_TEXTAREA_SELECTOR", _DIALOG_TEXTAREA_SELECTOR),
+            ("_DIALOG_EMAIL_INPUT_SELECTOR", _DIALOG_EMAIL_INPUT_SELECTOR),
+        ):
+            branches = [b.strip() for b in selector.split(",")]
+            assert branches, f"{name} is empty"
+            for branch in branches:
+                assert branch.startswith(_MODAL_OUTLET_SELECTOR), (
+                    f"{name} branch {branch!r} is not scoped to "
+                    f"{_MODAL_OUTLET_SELECTOR}; it can match LinkedIn's "
+                    "messaging overlay chat bubbles"
+                )
 
     async def test_submit_invite_dialog_reports_premium_after_add_note(self, mock_page):
         """Add-note Premium upsell is a note-limit block, not no-dialog."""
