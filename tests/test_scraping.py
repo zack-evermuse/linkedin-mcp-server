@@ -2451,9 +2451,22 @@ class TestConnectWithPerson:
         assert "preload/custom-invite" in await_args.args[0]
 
     async def test_follow_only_after_more_does_not_send(self, mock_page):
-        """Pending or genuinely follow-only profile: invite anchor never
-        appears even after More-menu open. Critical write-gate guardrail —
-        no deeplink fires, no connection request goes out."""
+        """Genuinely follow-only / restricted profile: no connection request
+        goes out. Critical write-gate guardrail.
+
+        The guardrail MOVED on 2026-08-26 and this test moved with it.
+        LinkedIn deleted the ``?vanityName=`` invite anchor from the profile
+        DOM, so "no anchor" stopped meaning "not connectable" — it became true
+        of every profile, including ones with a visible Connect button, and
+        the old anchor-based gate rejected 100% of sends.
+
+        The surviving signal is LinkedIn's own: for a restricted profile it
+        opens the invite dialog but gates it on the recipient's email address
+        and disables the send control (verified live on williamhgates). So the
+        deeplink now DOES fire — navigation is read-only and harmless — while
+        the thing that actually matters is unchanged and still asserted here:
+        ``_submit_invite_dialog`` is never awaited, so no invitation is sent.
+        """
         extractor = LinkedInExtractor(mock_page)
         text = "Public Figure\n\n· 3rd+\n\nCEO\n\nFollow\nMessage\nMore\n"
 
@@ -2478,6 +2491,72 @@ class TestConnectWithPerson:
             patch.object(
                 extractor, "_navigate_to_page", new_callable=AsyncMock
             ) as mock_nav,
+            # LinkedIn opens the invite dialog even for restricted profiles...
+            patch.object(
+                extractor,
+                "_dialog_is_open",
+                new_callable=AsyncMock,
+                return_value=True,
+            ),
+            # ...but gates it on the recipient's email address.
+            patch.object(
+                extractor,
+                "_invite_dialog_requires_email",
+                new_callable=AsyncMock,
+                return_value=True,
+            ) as mock_requires_email,
+            patch.object(extractor, "_dismiss_dialog", new_callable=AsyncMock),
+            patch.object(
+                extractor, "_submit_invite_dialog", new_callable=AsyncMock
+            ) as mock_submit,
+        ):
+            result = await extractor.connect_with_person("testuser")
+
+        assert result["status"] == "manual_send_required"
+        assert result.get("note_sent") is False or "note_sent" not in result
+        mock_open_more.assert_awaited_once()
+        # The email gate is what stops the send now — assert it was consulted.
+        mock_requires_email.assert_awaited()
+        # The deeplink is navigated (read-only, harmless)...
+        mock_nav.assert_awaited()
+        # ...but CRITICAL: the dialog is never submitted, so nothing is sent.
+        mock_submit.assert_not_awaited()
+
+    async def test_no_invite_dialog_reports_connect_unavailable(self, mock_page):
+        """When LinkedIn opens no invite dialog at all for the vanityName,
+        report connect_unavailable and never submit.
+
+        This is the other half of the post-anchor gate: _dialog_is_open False
+        is the "LinkedIn will not let us invite this person" signal that the
+        deleted anchor used to provide.
+        """
+        extractor = LinkedInExtractor(mock_page)
+        text = "Public Figure\n\n· 3rd+\n\nCEO\n\nFollow\nMessage\nMore\n"
+
+        with (
+            patch.object(extractor, "scrape_person", self._mock_scrape(text)),
+            patch.object(
+                extractor,
+                "_read_action_signals",
+                new_callable=AsyncMock,
+                side_effect=[
+                    self._signals(compose=True, labeled_action=True),
+                    self._signals(compose=True, labeled_action=True),
+                ],
+            ),
+            patch.object(
+                extractor,
+                "_open_more_menu",
+                new_callable=AsyncMock,
+                return_value=True,
+            ),
+            patch.object(extractor, "_navigate_to_page", new_callable=AsyncMock),
+            patch.object(
+                extractor,
+                "_dialog_is_open",
+                new_callable=AsyncMock,
+                return_value=False,
+            ),
             patch.object(
                 extractor, "_submit_invite_dialog", new_callable=AsyncMock
             ) as mock_submit,
@@ -2485,10 +2564,6 @@ class TestConnectWithPerson:
             result = await extractor.connect_with_person("testuser")
 
         assert result["status"] == "connect_unavailable"
-        assert result.get("note_sent") is False or "note_sent" not in result
-        mock_open_more.assert_awaited_once()
-        # Critical: deeplink must NOT fire and dialog must NOT be submitted.
-        mock_nav.assert_not_awaited()
         mock_submit.assert_not_awaited()
 
     async def test_follow_only_with_note_reports_note_limit_from_deeplink_probe(
@@ -2518,6 +2593,14 @@ class TestConnectWithPerson:
             patch.object(
                 extractor, "_navigate_to_page", new_callable=AsyncMock
             ) as mock_nav,
+            # LinkedIn opened no usable invite dialog; the note-limit probe is
+            # what explains why (Premium personalized-note quota exhausted).
+            patch.object(
+                extractor,
+                "_dialog_is_open",
+                new_callable=AsyncMock,
+                return_value=False,
+            ),
             patch.object(
                 extractor,
                 "_probe_invite_note_limit",
@@ -2542,7 +2625,11 @@ class TestConnectWithPerson:
 
     async def test_more_menu_unavailable_does_not_send(self, mock_page):
         """Action root present but no More button (unusual but possible):
-        _open_more_menu returns False, no retry, no deeplink fires."""
+        _open_more_menu returns False and no connection request goes out.
+
+        Post-2026-08-26 the deeplink probe still fires (navigation is
+        read-only); LinkedIn opening no invite dialog is what stops the send.
+        """
         extractor = LinkedInExtractor(mock_page)
         text = "Public Figure\n\n· 3rd+\n\nCEO\n\nFollow\nMessage\n"
 
@@ -2564,13 +2651,19 @@ class TestConnectWithPerson:
                 extractor, "_navigate_to_page", new_callable=AsyncMock
             ) as mock_nav,
             patch.object(
+                extractor,
+                "_dialog_is_open",
+                new_callable=AsyncMock,
+                return_value=False,
+            ),
+            patch.object(
                 extractor, "_submit_invite_dialog", new_callable=AsyncMock
             ) as mock_submit,
         ):
             result = await extractor.connect_with_person("testuser")
 
         assert result["status"] == "connect_unavailable"
-        mock_nav.assert_not_awaited()
+        mock_nav.assert_awaited()
         mock_submit.assert_not_awaited()
 
     async def test_returns_pending(self, mock_page):
