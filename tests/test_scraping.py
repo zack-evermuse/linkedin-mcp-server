@@ -9809,6 +9809,14 @@ class TestEveryNormalizedEntryPoint:
         selectors kept receiving the URL where they expect the vanity.
         """
         extractor = LinkedInExtractor(mock_page)
+        # No-signals connection state falls through to the deeplink send
+        # path, which dismisses the dialog on the way out via
+        # page.keyboard.press("Escape"). Unset, mock_page's autospec
+        # MagicMock keyboard.press is not awaitable and raises TypeError --
+        # this test cares about normalization, not the send path it
+        # incidentally reaches.
+        mock_page.keyboard = MagicMock()
+        mock_page.keyboard.press = AsyncMock()
         seen: list[str] = []
         with (
             patch.object(
