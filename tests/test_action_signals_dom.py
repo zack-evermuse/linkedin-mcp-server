@@ -47,6 +47,7 @@ from linkedin_mcp_server.linkedin.connection import (
 from linkedin_mcp_server.linkedin.connection_actions import (
     ACTION_SIGNALS_JS,
     CLICK_INCOMING_ACCEPT_JS,
+    OPEN_INCOMING_ROW_MORE_BUTTON_JS,
     OPEN_MORE_BUTTON_JS,
     ConnectionActions,
 )
@@ -90,6 +91,7 @@ class Labels:
     show_all: str
     like: str
     comment: str
+    save: str
 
 
 ENGLISH = Labels(
@@ -110,6 +112,7 @@ ENGLISH = Labels(
     show_all="Show all",
     like="Like",
     comment="Comment",
+    save="Save Marc Banoub in Sales Navigator",
 )
 
 GERMAN = Labels(
@@ -130,6 +133,7 @@ GERMAN = Labels(
     show_all="Mehr anzeigen",
     like="Gefällt mir",
     comment="Kommentieren",
+    save="Marc Banoub in Sales Navigator speichern",
 )
 
 # No verb anywhere, in any language: these labels are identifiers. Whatever
@@ -153,6 +157,7 @@ OPAQUE = Labels(
     show_all="b8f2c9",
     like="c6d0a3",
     comment="d4e8b7",
+    save="e7f1a5",
 )
 
 # Attribute presence and attribute truthiness are different contracts. This
@@ -176,6 +181,7 @@ EMPTY_ARIA = Labels(
     show_all="",
     like="",
     comment="",
+    save="",
 )
 
 LOCALES = (ENGLISH, GERMAN, OPAQUE, EMPTY_ARIA)
@@ -301,6 +307,48 @@ def follow_only_top_card(labels: Labels) -> str:
 """
 
 
+def creator_mode_top_card(labels: Labels) -> str:
+    """Creator-mode / high-follower profile with NO Message anchor at all
+    (unlike ``follow_only_top_card`` above), so Connect is demoted into the
+    More menu and this row matches the incoming-request fingerprint exactly:
+    two labeled buttons plus one unlabeled expander, DOM-ordered, three
+    buttons total. Regression fixture for marc-banoub, 2026-07-29, where an
+    unguarded Accept click landed on the first labeled button here — Follow.
+    """
+    return f"""
+<section class="topcard">
+  <h1>Marc Banoub</h1>
+  <div class="actions">
+    <button type="button" aria-label="{labels.follow}"
+      onclick="document.body.setAttribute('data-clicked','follow')"
+      >{labels.follow}</button>
+    <button type="button" aria-label="{labels.save}"
+      onclick="document.body.setAttribute('data-clicked','save')"
+      >{labels.save}</button>
+    <button type="button" aria-expanded="false"
+      onclick="document.body.setAttribute('data-clicked','more')"
+      >{labels.more}</button>
+  </div>
+</section>
+"""
+
+
+def creator_mode_more_menu_portal(labels: Labels) -> str:
+    """The More menu's contents render in a portal outside <main>, which is
+    why ``hasInvite`` searches ``document`` rather than ``main``. A Connect
+    action and an invitation pending from that person are mutually
+    exclusive, so this vanityName anchor surfacing here is a decisive
+    disproof of the incoming-request classification."""
+    return f"""
+<div role="menu" class="portal">
+  <a href="/preload/custom-invite/?vanityName={USER}"
+    aria-label="{labels.connect}">{labels.connect}</a>
+  <a href="/messaging/compose/?profileUrn=urn%3Ali%3Afsd_profile%3AEEE"
+    >{labels.message}</a>
+</div>
+"""
+
+
 def pending_top_card(labels: Labels) -> str:
     """Awaiting response: the Pending control is a labeled <a>, not a button."""
     return f"""
@@ -385,8 +433,8 @@ def extra_button_row(labels: Labels) -> str:
 """
 
 
-def _page_html(*sections: str) -> str:
-    return f"<html><body><main>{''.join(sections)}</main></body></html>"
+def _page_html(*sections: str, portal: str = "") -> str:
+    return f"<html><body><main>{''.join(sections)}</main>{portal}</body></html>"
 
 
 def _both(first: Build, second: Build) -> Build:
@@ -448,6 +496,10 @@ async def _signals(page, html: str) -> dict:
 
 async def _fingerprint(page, html: str) -> bool:
     return bool((await _signals(page, html))["hasIncomingActionRow"])
+
+
+async def _has_invite(page, html: str) -> bool:
+    return bool((await _signals(page, html))["hasInvite"])
 
 
 async def _state(page, html: str) -> ConnectionState:
@@ -514,6 +566,11 @@ FINGERPRINT_CASES: tuple[tuple[str, Build, bool], ...] = (
     ("follow-only-row", follow_only_top_card, False),
     ("pending-row", pending_top_card, False),
     ("connected-row", _both(connected_top_card, sidebar_section), False),
+    # Regression: the creator-mode card (no Message anchor at all) satisfies
+    # every exclusion above and matches the fingerprint despite not being an
+    # incoming request. This is why connect_with_person must disprove the
+    # classification via the More-menu probe before clicking Accept.
+    ("creator-mode-no-message-anchor", creator_mode_top_card, True),
 )
 
 
@@ -654,3 +711,80 @@ class TestAClickOnlyLandsOnLinkedIn:
             await dom_page.evaluate("document.body.getAttribute('data-clicked')")
             == "first-labeled"
         )
+
+
+class TestCreatorModeFalsePositive:
+    """The fingerprint alone cannot distinguish a creator-mode card from an
+    incoming request; connect_with_person must disprove it via the More menu
+    before clicking Accept.
+
+    Regression: marc-banoub 2026-07-29, where the Accept click landed on
+    Follow and the run reported send_failed with no invitation created.
+    """
+
+    async def test_creator_card_has_no_invite_anchor_before_the_probe(self, dom_page):
+        # Documents the false positive rather than asserting it away: every
+        # exclusion passes because there is no Message anchor and Connect is
+        # not in the DOM until More is opened.
+        await _in_every_locale(dom_page, creator_mode_top_card, False, _has_invite)
+
+    async def test_accept_click_would_land_on_follow(self, dom_page):
+        # Why this is a safety bug and not a mere misreport: the click is a
+        # real, user-visible write on the wrong control.
+        await _in_every_locale(
+            dom_page,
+            creator_mode_top_card,
+            (True, "follow"),
+            lambda page, html: _click(page, html, CLICK_INCOMING_ACCEPT_JS),
+        )
+
+    async def test_generic_more_opener_cannot_reach_creator_card(self, dom_page):
+        # The trap: OPEN_MORE_BUTTON_JS finds More via findActionRoot, which
+        # walks up from a /messaging/compose/ anchor. Creator-mode cards have
+        # no Message button, so it returns false -- reusing it for the
+        # disproof probe would make the fix a no-op on exactly these
+        # profiles.
+        await _in_every_locale(
+            dom_page,
+            creator_mode_top_card,
+            (False, None),
+            lambda page, html: _click(page, html, OPEN_MORE_BUTTON_JS),
+        )
+
+    async def test_row_scoped_more_opener_reaches_creator_card(self, dom_page):
+        await _in_every_locale(
+            dom_page,
+            creator_mode_top_card,
+            (True, "more"),
+            lambda page, html: _click(page, html, OPEN_INCOMING_ROW_MORE_BUTTON_JS),
+        )
+
+    async def test_invite_anchor_in_portal_menu_disproves_incoming(self, dom_page):
+        # Post-open state: the menu is portal-rendered outside <main>, and
+        # hasInvite searches `document`, so the vanityName anchor surfaces
+        # and disproves the incoming-request classification.
+        answers = {}
+        for labels in LOCALES:
+            await dom_page.set_content(
+                _page_html(
+                    creator_mode_top_card(labels),
+                    portal=creator_mode_more_menu_portal(labels),
+                )
+            )
+            data = await dom_page.evaluate(ACTION_SIGNALS_JS, USER)
+            answers[labels.locale] = data["hasInvite"]
+        assert answers == {labels.locale: True for labels in LOCALES}
+
+    async def test_genuine_incoming_row_exposes_no_invite_anchor_under_more(
+        self, dom_page
+    ):
+        # The disproof must not fire on real incoming requests: an open More
+        # menu there offers no Connect, so the Accept path still runs.
+        for labels in LOCALES:
+            html = _both(incoming_top_card, sidebar_section)(labels)
+            await dom_page.set_content(_page_html(html))
+            opened = await dom_page.evaluate(OPEN_INCOMING_ROW_MORE_BUTTON_JS)
+            assert opened is True, labels.locale
+            data = await dom_page.evaluate(ACTION_SIGNALS_JS, USER)
+            assert data["hasIncomingActionRow"] is True, labels.locale
+            assert data["hasInvite"] is False, labels.locale
