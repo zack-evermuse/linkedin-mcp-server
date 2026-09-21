@@ -571,7 +571,19 @@ async def test_incoming_verification_resolves_classifier_at_call_time(
             ConnectionActions,
             "_read_action_signals",
             new_callable=AsyncMock,
-            side_effect=[incoming, connected],
+            # 1st: initial detection. 2nd: the More-menu disproof probe run
+            # before the irreversible Accept click (still no invite anchor,
+            # so the classification stands). 3rd: post-accept verification.
+            # The probe's signals never reach the classifier directly -- only
+            # its has_invite_anchor is read -- so `calls` still holds exactly
+            # the two values the classifier itself was called with.
+            side_effect=[incoming, incoming, connected],
+        ),
+        patch.object(
+            ConnectionActions,
+            "_open_incoming_row_more_menu",
+            new_callable=AsyncMock,
+            return_value=True,
         ),
         patch.object(
             ConnectionActions,
