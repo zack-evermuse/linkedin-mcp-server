@@ -20,7 +20,14 @@ import pytest
 from patchright.async_api import TimeoutError as PlaywrightTimeoutError
 
 from linkedin_mcp_server.linkedin.connection import ActionSignals
-from linkedin_mcp_server.linkedin.connection_actions import ConnectionActions
+from linkedin_mcp_server.linkedin.connection_actions import (
+    ConnectionActions,
+    _DIALOG_EMAIL_INPUT_SELECTOR,
+    _DIALOG_PREMIUM_LINK_SELECTOR,
+    _DIALOG_SELECTOR,
+    _DIALOG_TEXTAREA_SELECTOR,
+    _MODAL_OUTLET_SELECTOR,
+)
 from linkedin_mcp_server.linkedin.navigation import PageNavigator
 from linkedin_mcp_server.linkedin.session import PageSession
 
@@ -212,7 +219,7 @@ class TestConnectWithPerson:
             result = await actions.connect_with_person("testuser")
 
         assert result["status"] == "connected"
-        assert state in result["message"]
+        assert "Confirmed" in result["message"]
         mock_sleep.assert_awaited_once()
 
     @pytest.mark.parametrize(
@@ -365,9 +372,22 @@ class TestConnectWithPerson:
         assert "preload/custom-invite" in await_args.args[0]
 
     async def test_follow_only_after_more_does_not_send(self, mock_page):
-        """Pending or genuinely follow-only profile: invite anchor never
-        appears even after More-menu open. Critical write-gate guardrail —
-        no deeplink fires, no connection request goes out."""
+        """Genuinely follow-only / restricted profile: no connection request
+        goes out. Critical write-gate guardrail.
+
+        The guardrail MOVED on 2026-08-26 and this test moved with it.
+        LinkedIn deleted the ``?vanityName=`` invite anchor from the profile
+        DOM, so "no anchor" stopped meaning "not connectable" — it became true
+        of every profile, including ones with a visible Connect button, and
+        the old anchor-based gate rejected 100% of sends.
+
+        The surviving signal is LinkedIn's own: for a restricted profile it
+        opens the invite dialog but gates it on the recipient's email address
+        and disables the send control (verified live on williamhgates). So the
+        deeplink now DOES fire — navigation is read-only and harmless — while
+        the thing that actually matters is unchanged and still asserted here:
+        ``_submit_invite_dialog`` is never awaited, so no invitation is sent.
+        """
         text = "Public Figure\n\n· 3rd+\n\nCEO\n\nFollow\nMessage\nMore\n"
         actions = _actions(mock_page, _reads(text))
 
@@ -391,22 +411,80 @@ class TestConnectWithPerson:
             patch.object(
                 PageNavigator, "_navigate_to_page", new_callable=AsyncMock
             ) as mock_nav,
+            # LinkedIn opens the invite dialog even for restricted profiles...
+            patch.object(
+                actions,
+                "_dialog_is_open",
+                new_callable=AsyncMock,
+                return_value=True,
+            ),
+            # ...but gates it on the recipient's email address.
+            patch.object(
+                actions,
+                "_invite_dialog_requires_email",
+                new_callable=AsyncMock,
+                return_value=True,
+            ) as mock_requires_email,
+            patch.object(actions, "_dismiss_dialog", new_callable=AsyncMock),
             patch.object(
                 actions,
                 "_submit_invite_dialog",
                 new_callable=AsyncMock,
-                # A successful submit, so a gate that stopped holding reports
-                # the deeplink it fired rather than crashing on the mock.
-                return_value=(True, False, None),
+            ) as mock_submit,
+        ):
+            result = await actions.connect_with_person("testuser")
+
+        assert result["status"] == "manual_send_required"
+        assert result.get("note_sent") is False or "note_sent" not in result
+        mock_open_more.assert_awaited_once()
+        # The email gate is what stops the send now — assert it was consulted.
+        mock_requires_email.assert_awaited()
+        # The deeplink is navigated (read-only, harmless)...
+        mock_nav.assert_awaited()
+        # ...but CRITICAL: the dialog is never submitted, so nothing is sent.
+        mock_submit.assert_not_awaited()
+
+    async def test_no_invite_dialog_reports_connect_unavailable(self, mock_page):
+        """When LinkedIn opens no invite dialog at all for the vanityName,
+        report connect_unavailable and never submit.
+
+        This is the other half of the post-anchor gate: _dialog_is_open False
+        is the "LinkedIn will not let us invite this person" signal that the
+        deleted anchor used to provide.
+        """
+        text = "Public Figure\n\n· 3rd+\n\nCEO\n\nFollow\nMessage\nMore\n"
+        actions = _actions(mock_page, _reads(text))
+
+        with (
+            patch.object(
+                actions,
+                "_read_action_signals",
+                new_callable=AsyncMock,
+                side_effect=[
+                    _signals(compose=True, labeled_action=True),
+                    _signals(compose=True, labeled_action=True),
+                ],
+            ),
+            patch.object(
+                actions,
+                "_open_more_menu",
+                new_callable=AsyncMock,
+                return_value=True,
+            ),
+            patch.object(PageNavigator, "_navigate_to_page", new_callable=AsyncMock),
+            patch.object(
+                actions,
+                "_dialog_is_open",
+                new_callable=AsyncMock,
+                return_value=False,
+            ),
+            patch.object(
+                actions, "_submit_invite_dialog", new_callable=AsyncMock
             ) as mock_submit,
         ):
             result = await actions.connect_with_person("testuser")
 
         assert result["status"] == "connect_unavailable"
-        assert result.get("note_sent") is False or "note_sent" not in result
-        mock_open_more.assert_awaited_once()
-        # Critical: deeplink must NOT fire and dialog must NOT be submitted.
-        mock_nav.assert_not_awaited()
         mock_submit.assert_not_awaited()
 
     async def test_follow_only_with_note_reports_note_limit_from_deeplink_probe(
@@ -435,6 +513,14 @@ class TestConnectWithPerson:
             patch.object(
                 PageNavigator, "_navigate_to_page", new_callable=AsyncMock
             ) as mock_nav,
+            # LinkedIn opened no usable invite dialog; the note-limit probe is
+            # what explains why (Premium personalized-note quota exhausted).
+            patch.object(
+                actions,
+                "_dialog_is_open",
+                new_callable=AsyncMock,
+                return_value=False,
+            ),
             patch.object(
                 actions,
                 "_probe_invite_note_limit",
@@ -461,7 +547,11 @@ class TestConnectWithPerson:
 
     async def test_more_menu_unavailable_does_not_send(self, mock_page):
         """Action root present but no More button (unusual but possible):
-        _open_more_menu returns False, no retry, no deeplink fires."""
+        _open_more_menu returns False and no connection request goes out.
+
+        Post-2026-08-26 the deeplink probe still fires (navigation is
+        read-only); LinkedIn opening no invite dialog is what stops the send.
+        """
         text = "Public Figure\n\n· 3rd+\n\nCEO\n\nFollow\nMessage\n"
         actions = _actions(mock_page, _reads(text))
 
@@ -483,6 +573,12 @@ class TestConnectWithPerson:
             ) as mock_nav,
             patch.object(
                 actions,
+                "_dialog_is_open",
+                new_callable=AsyncMock,
+                return_value=False,
+            ),
+            patch.object(
+                actions,
                 "_submit_invite_dialog",
                 new_callable=AsyncMock,
                 # A successful submit, so a gate that stopped holding reports
@@ -493,7 +589,7 @@ class TestConnectWithPerson:
             result = await actions.connect_with_person("testuser")
 
         assert result["status"] == "connect_unavailable"
-        mock_nav.assert_not_awaited()
+        mock_nav.assert_awaited()
         mock_submit.assert_not_awaited()
 
     async def test_returns_pending(self, mock_page):
@@ -894,10 +990,45 @@ class TestInviteDialog:
         result = await actions._get_premium_upsell_message(timeout=1234)
 
         assert result == PREMIUM_MESSAGE
-        mock_page.locator.assert_called_once_with(
-            'dialog[open] a[href*="/premium/"], [role="dialog"] a[href*="/premium/"]'
-        )
+        # Assert against the constant, not a copy of its value: the previous
+        # hardcoded literal silently encoded the unscoped selector that let
+        # the messaging overlay's chat bubbles match as invite dialogs.
+        mock_page.locator.assert_called_once_with(_DIALOG_PREMIUM_LINK_SELECTOR)
+        assert _MODAL_OUTLET_SELECTOR in _DIALOG_PREMIUM_LINK_SELECTOR
         premium_link.wait_for.assert_awaited_once_with(state="visible", timeout=1234)
+
+    def test_every_dialog_selector_is_scoped_to_the_modal_outlet(self):
+        """Dialog selectors must never match outside LinkedIn's modal outlet.
+
+        `[role="dialog"]` is not unique to modals: LinkedIn's messaging
+        overlay renders every open chat bubble with that role. An unscoped
+        selector therefore matched the invite modal plus each chat bubble,
+        and the positional button indexing in `_submit_invite_dialog`
+        (`nth(count - 1)` primary, `nth(count - 2)` secondary) indexed into
+        the combined list. Measured live 2026-07-29 with two chat bubbles
+        open: 51 buttons instead of 3, with `nth(count - 1)` landing on a
+        chat window's "Open send options" and `nth(count - 2)` on its
+        "Send". That is the "deeplink opens no dialog" defect, and it also
+        put a real message-send control on the invite write path.
+
+        This is a guard against re-simplifying the scoping away. Each
+        comma-separated branch must carry the outlet prefix -- prefixing
+        only the first branch reopens the bug for the second.
+        """
+        for name, selector in (
+            ("_DIALOG_SELECTOR", _DIALOG_SELECTOR),
+            ("_DIALOG_PREMIUM_LINK_SELECTOR", _DIALOG_PREMIUM_LINK_SELECTOR),
+            ("_DIALOG_TEXTAREA_SELECTOR", _DIALOG_TEXTAREA_SELECTOR),
+            ("_DIALOG_EMAIL_INPUT_SELECTOR", _DIALOG_EMAIL_INPUT_SELECTOR),
+        ):
+            branches = [b.strip() for b in selector.split(",")]
+            assert branches, f"{name} is empty"
+            for branch in branches:
+                assert branch.startswith(_MODAL_OUTLET_SELECTOR), (
+                    f"{name} branch {branch!r} is not scoped to "
+                    f"{_MODAL_OUTLET_SELECTOR}; it can match LinkedIn's "
+                    "messaging overlay chat bubbles"
+                )
 
     async def test_reports_premium_after_add_note(self, mock_page):
         """Add-note Premium upsell is a note-limit block, not no-dialog."""
