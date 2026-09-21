@@ -53,6 +53,14 @@ _DIALOG_PREMIUM_LINK_SELECTOR = (
     'dialog[open] a[href*="/premium/"], [role="dialog"] a[href*="/premium/"]'
 )
 _DIALOG_TEXTAREA_SELECTOR = '[role="dialog"] textarea, dialog textarea'
+# LinkedIn gates some invitations behind the recipient's email address
+# ("we need to verify you know this person"). Detected by input *type*,
+# which is an HTML attribute value rather than UI copy, so it holds across
+# locales. Only the account owner can answer that prompt, so the tool
+# reports it instead of attempting to satisfy it.
+_DIALOG_EMAIL_INPUT_SELECTOR = (
+    '[role="dialog"] input[type="email"], dialog input[type="email"]'
+)
 
 # Shared JS function that walks up from any /messaging/compose/ anchor
 # inside <main> to find the smallest ancestor that satisfies the
@@ -262,6 +270,26 @@ OPEN_MORE_BUTTON_JS = (
 """
 )
 
+# Click the vanityName invite anchor wherever it currently sits — the
+# top-card action bar or an open More-menu overlay. Used as the fallback
+# when the custom-invite deeplink opens no dialog (see
+# connect_with_person). The selector is the same URL pattern the detection
+# path already trusts, scoped to the target's vanityName, so this adds no
+# new locale dependence and cannot match a Connect control belonging to
+# another profile on the page. document scope is required: LinkedIn
+# renders the More menu in a portal outside <main>.
+CLICK_INVITE_ANCHOR_JS = r"""
+((username) => {
+  const safe = CSS.escape(username);
+  const el = document.querySelector(
+    `a[href*="/preload/custom-invite/?vanityName=${safe}"]`
+  );
+  if (!el) return false;
+  el.click();
+  return true;
+})
+"""
+
 # Click Accept on an incoming-request profile. Accept is the FIRST labeled
 # button in the fingerprinted row — primary actions render first in
 # top-card action rows (Connect/Message lead on other profile states; the
@@ -362,6 +390,26 @@ class ConnectionActions:
             await locator.first.wait_for(state="visible", timeout=timeout)
             return True
         except Exception:
+            return False
+
+    async def _invite_dialog_requires_email(self) -> bool:
+        """Return whether an open invite dialog is gated on a recipient email.
+
+        Structural check on ``input[type="email"]`` inside the dialog, per
+        the AGENTS.md Scraping Rules — an attribute value fixed by HTML,
+        not localized UI copy. Verified live 2026-07-29 against
+        angelosangelou, whose invite dialog opens normally but cannot be
+        submitted without the recipient's address.
+        """
+        if not await self._dialog_is_open(timeout=1000):
+            return False
+        try:
+            return (
+                await self._session.page.locator(_DIALOG_EMAIL_INPUT_SELECTOR).count()
+                > 0
+            )
+        except Exception:
+            logger.debug("Email-gate probe failed", exc_info=True)
             return False
 
     async def _click_dialog_primary_button(self, *, timeout: int = 5000) -> bool:
@@ -478,6 +526,37 @@ class ConnectionActions:
         except PlaywrightTimeoutError:
             logger.debug("More menu did not appear after click")
             return False
+
+    async def _click_invite_anchor(self, username: str) -> bool:
+        """Click the vanityName invite anchor, opening the More menu if needed.
+
+        The custom-invite deeplink is the primary send path, but LinkedIn
+        does not honour it for every profile: on some accounts it lands on
+        a page with no invite dialog at all, while the Connect item in the
+        More menu works normally. Verified live 2026-07-29 against five
+        such profiles (tejaswi-tenneti-78a66116, angelosangelou,
+        johnroa27, sametozkale, sergii-shcherbak-10068866), each of which
+        exposed Connect under More by hand while the deeplink returned no
+        dialog.
+
+        Returns True iff the anchor was found and clicked. The caller is
+        expected to follow with ``_submit_invite_dialog``; this helper
+        deliberately does not wait for or dismiss the dialog.
+        """
+        for attempt in ("direct", "more-menu"):
+            if attempt == "more-menu" and not await self._open_more_menu():
+                return False
+            try:
+                clicked = await self._session.page.evaluate(
+                    CLICK_INVITE_ANCHOR_JS, username
+                )
+            except Exception:
+                logger.debug("Invite anchor click via JS failed", exc_info=True)
+                return False
+            if clicked:
+                logger.info("Clicked invite anchor for %s (%s)", username, attempt)
+                return True
+        return False
 
     async def _click_incoming_accept(self) -> bool:
         """Click Accept on an incoming-request profile, locale-independently.
@@ -1048,6 +1127,49 @@ class ConnectionActions:
                 profile=page_text,
             )
         if not submitted:
+            # The deeplink is not universally honoured. On some profiles it
+            # renders no invite dialog even though the Connect control in the
+            # More menu works by hand — five such profiles verified live
+            # 2026-07-29. Fall back to clicking the anchor itself, which is
+            # the same URL the write-gate already matched on, so this widens
+            # the send path without widening what we are willing to click.
+            logger.info(
+                "Deeplink opened no invite dialog for %s; falling back to "
+                "clicking the invite anchor",
+                username,
+            )
+            await self._navigator._navigate_to_page(url)
+            if await self._click_invite_anchor(username):
+                (
+                    submitted,
+                    note_sent,
+                    note_limit_message,
+                ) = await self._submit_invite_dialog(note)
+                if note_limit_message is not None:
+                    return _connection_result(
+                        url,
+                        "custom_note_limit_reached",
+                        note_limit_message,
+                        note_sent=False,
+                        profile=page_text,
+                    )
+        if not submitted:
+            # Distinguish "LinkedIn wants more from the human" from a plain
+            # failure: some profiles gate the invite behind an email-address
+            # field that only the account owner can answer (angelosangelou,
+            # verified by hand 2026-07-29). Nothing should route around that
+            # gate, so report it as its own status and let the caller queue
+            # the person for a manual send.
+            if await self._invite_dialog_requires_email():
+                await self._dismiss_dialog()
+                return _connection_result(
+                    url,
+                    "manual_send_required",
+                    "LinkedIn requires this person's email address before the "
+                    "invitation can be sent. Send it manually.",
+                    note_sent=False,
+                    profile=page_text,
+                )
             return _connection_result(
                 url,
                 "connect_unavailable",
