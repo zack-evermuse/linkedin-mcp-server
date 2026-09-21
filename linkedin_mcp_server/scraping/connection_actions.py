@@ -43,24 +43,61 @@ from linkedin_mcp_server.scraping.session import ScrapingSession
 
 logger = logging.getLogger(__name__)
 
-# A messaging overlay (a minimised chat bubble LinkedIn keeps open across
-# pages) is also a dialog. Its composer never belongs to an invite, and its
-# buttons would otherwise join the positional picks below: measured live in
-# September 2026, the last one was the chat's "Open send options" toggle.
-_NOT_MESSAGING = ':not(:has([contenteditable="true"]))'
-_DIALOG_SELECTOR = f'dialog[open]{_NOT_MESSAGING}, [role="dialog"]{_NOT_MESSAGING}'
-_DIALOG_PREMIUM_LINK_SELECTOR = (
-    'dialog[open] a[href*="/premium/"], [role="dialog"] a[href*="/premium/"]'
+# Every dialog selector below is scoped to LinkedIn's modal outlet, and that
+# scoping is load-bearing -- not tidiness.
+#
+# `[role="dialog"]` on its own is NOT unique to modals. LinkedIn's messaging
+# overlay renders each open chat bubble as a `[role="dialog"]` inside
+# `ASIDE#msg-overlay`, and those bubbles hydrate about a second after
+# `domcontentloaded`. So on any account with open message threads, an
+# unscoped `dialog[open], [role="dialog"]` matched the invite modal *plus*
+# every chat bubble, and the positional button indexing this module relies on
+# (`nth(count - 1)` for the primary action, `nth(count - 2)` for the
+# secondary) then indexed into a list spanning all of them.
+#
+# Measured live 2026-07-29 on an account with two chat bubbles open:
+#   unscoped:  3 dialogs, 51 buttons -> nth(50) = "Open send options",
+#                                       nth(49) = "Send"  (both belong to a
+#                                       chat bubble, not the invitation)
+#   outlet:    1 dialog,   3 buttons -> nth(2)  = "Send without a note",
+#                                       nth(1)  = "Add a note"  (correct)
+# That is the whole of the "deeplink opens no dialog" defect: the deeplink
+# opens the dialog fine, but Send was clicked in a chat window, the invite
+# modal never closed, and the caller reported connect_unavailable. It looked
+# profile-dependent only because it is really a race with overlay hydration.
+#
+# `aria-modal` is not usable as the discriminator -- LinkedIn does not set it
+# on the invite dialog (verified live). The outlet id is the available
+# structural signal, and it is locale-independent per the AGENTS.md Scraping
+# Rules: an element id, not layout classes and not UI copy. If LinkedIn ever
+# renames it, every helper here reports "no dialog" and callers fail closed
+# with connect_unavailable rather than clicking something unintended --
+# `_dialog_is_open` logs explicitly when that happens.
+_MODAL_OUTLET_SELECTOR = "#artdeco-modal-outlet"
+_DIALOG_SELECTOR = (
+    f'{_MODAL_OUTLET_SELECTOR} dialog[open], {_MODAL_OUTLET_SELECTOR} [role="dialog"]'
 )
-_DIALOG_TEXTAREA_SELECTOR = '[role="dialog"] textarea, dialog textarea'
+_DIALOG_PREMIUM_LINK_SELECTOR = (
+    f'{_MODAL_OUTLET_SELECTOR} dialog[open] a[href*="/premium/"], '
+    f'{_MODAL_OUTLET_SELECTOR} [role="dialog"] a[href*="/premium/"]'
+)
+_DIALOG_TEXTAREA_SELECTOR = (
+    f'{_MODAL_OUTLET_SELECTOR} [role="dialog"] textarea, '
+    f"{_MODAL_OUTLET_SELECTOR} dialog textarea"
+)
 # LinkedIn gates some invitations behind the recipient's email address
 # ("we need to verify you know this person"). Detected by input *type*,
 # which is an HTML attribute value rather than UI copy, so it holds across
 # locales. Only the account owner can answer that prompt, so the tool
 # reports it instead of attempting to satisfy it.
 _DIALOG_EMAIL_INPUT_SELECTOR = (
-    '[role="dialog"] input[type="email"], dialog input[type="email"]'
+    f'{_MODAL_OUTLET_SELECTOR} [role="dialog"] input[type="email"], '
+    f'{_MODAL_OUTLET_SELECTOR} dialog input[type="email"]'
 )
+# Any dialog anywhere, used only to tell "LinkedIn rendered nothing" apart
+# from "LinkedIn rendered a dialog somewhere we no longer recognise". Never
+# use this to click: that is exactly the bug described above.
+_ANY_DIALOG_SELECTOR = 'dialog[open], [role="dialog"]'
 
 # Shared JS function that walks up from any /messaging/compose/ anchor
 # inside <main> to find the smallest ancestor that satisfies the
@@ -270,26 +307,6 @@ OPEN_MORE_BUTTON_JS = (
 """
 )
 
-# Click the vanityName invite anchor wherever it currently sits — the
-# top-card action bar or an open More-menu overlay. Used as the fallback
-# when the custom-invite deeplink opens no dialog (see
-# connect_with_person). The selector is the same URL pattern the detection
-# path already trusts, scoped to the target's vanityName, so this adds no
-# new locale dependence and cannot match a Connect control belonging to
-# another profile on the page. document scope is required: LinkedIn
-# renders the More menu in a portal outside <main>.
-CLICK_INVITE_ANCHOR_JS = r"""
-((username) => {
-  const safe = CSS.escape(username);
-  const el = document.querySelector(
-    `a[href*="/preload/custom-invite/?vanityName=${safe}"]`
-  );
-  if (!el) return false;
-  el.click();
-  return true;
-})
-"""
-
 # Click Accept on an incoming-request profile. Accept is the FIRST labeled
 # button in the fingerprinted row — primary actions render first in
 # top-card action rows (Connect/Message lead on other profile states; the
@@ -382,15 +399,40 @@ class ConnectionActions:
         self._read_main_profile = read_main_profile
 
     async def _dialog_is_open(self, *, timeout: int = 1000) -> bool:
-        """Return whether a dialog is currently open (structural check)."""
-        locator = self._session.page.locator(_DIALOG_SELECTOR)
+        """Return whether a modal dialog is currently open (structural check).
+
+        Waits for a *visible* modal to appear rather than sampling the DOM
+        once: the previous implementation returned False immediately when
+        ``count() == 0``, which made the ``timeout`` argument dead for the
+        case it exists to cover -- a dialog that has not rendered yet. The
+        page is navigated with ``wait_until="domcontentloaded"``, so a
+        dialog mounted during hydration could be missed entirely.
+        """
         try:
-            if await locator.count() == 0:
-                return False
-            await locator.first.wait_for(state="visible", timeout=timeout)
+            await self._session.page.wait_for_selector(
+                _DIALOG_SELECTOR, state="visible", timeout=timeout
+            )
             return True
         except Exception:
-            return False
+            pass
+        # No modal in the outlet. Distinguish "LinkedIn showed nothing" from
+        # "LinkedIn showed a dialog somewhere _MODAL_OUTLET_SELECTOR no
+        # longer covers" -- the second means this module's scoping has gone
+        # stale and every invite will fail closed until it is updated. That
+        # is worth a log line rather than a silent connect_unavailable.
+        try:
+            stray = await self._session.page.locator(_ANY_DIALOG_SELECTOR).count()
+            if stray:
+                logger.warning(
+                    "No dialog inside %s, but %d dialog(s) exist elsewhere on "
+                    "the page. If invites are failing, LinkedIn may have moved "
+                    "the modal outlet and the selector needs updating.",
+                    _MODAL_OUTLET_SELECTOR,
+                    stray,
+                )
+        except Exception:
+            logger.debug("Stray-dialog diagnostic failed", exc_info=True)
+        return False
 
     async def _invite_dialog_requires_email(self) -> bool:
         """Return whether an open invite dialog is gated on a recipient email.
@@ -477,13 +519,14 @@ class ConnectionActions:
 
         try:
             message = await self._session.page.evaluate(
-                """() => {
-                    const link = document.querySelector(
-                        'dialog[open] a[href*="/premium/"], [role="dialog"] a[href*="/premium/"]'
-                    );
+                """(selector) => {
+                    const link = document.querySelector(selector);
                     const dialog = link?.closest('dialog,[role="dialog"]');
                     return dialog?.innerText || dialog?.textContent || link?.innerText || '';
-                }"""
+                }""",
+                # Same outlet-scoped selector the locator above used. Kept as
+                # an argument rather than inlined so the two can never drift.
+                _DIALOG_PREMIUM_LINK_SELECTOR,
             )
             if isinstance(message, str) and message.strip():
                 return message.strip()
@@ -526,37 +569,6 @@ class ConnectionActions:
         except PlaywrightTimeoutError:
             logger.debug("More menu did not appear after click")
             return False
-
-    async def _click_invite_anchor(self, username: str) -> bool:
-        """Click the vanityName invite anchor, opening the More menu if needed.
-
-        The custom-invite deeplink is the primary send path, but LinkedIn
-        does not honour it for every profile: on some accounts it lands on
-        a page with no invite dialog at all, while the Connect item in the
-        More menu works normally. Verified live 2026-07-29 against five
-        such profiles (tejaswi-tenneti-78a66116, angelosangelou,
-        johnroa27, sametozkale, sergii-shcherbak-10068866), each of which
-        exposed Connect under More by hand while the deeplink returned no
-        dialog.
-
-        Returns True iff the anchor was found and clicked. The caller is
-        expected to follow with ``_submit_invite_dialog``; this helper
-        deliberately does not wait for or dismiss the dialog.
-        """
-        for attempt in ("direct", "more-menu"):
-            if attempt == "more-menu" and not await self._open_more_menu():
-                return False
-            try:
-                clicked = await self._session.page.evaluate(
-                    CLICK_INVITE_ANCHOR_JS, username
-                )
-            except Exception:
-                logger.debug("Invite anchor click via JS failed", exc_info=True)
-                return False
-            if clicked:
-                logger.info("Clicked invite anchor for %s (%s)", username, attempt)
-                return True
-        return False
 
     async def _click_incoming_accept(self) -> bool:
         """Click Accept on an incoming-request profile, locale-independently.
@@ -859,6 +871,177 @@ class ConnectionActions:
         await self._dismiss_dialog()
         return note_limit_message
 
+    async def _send_via_custom_invite_deeplink(
+        self,
+        url: str,
+        username: str,
+        note: str | None,
+        page_text: str,
+    ) -> dict[str, Any] | None:
+        """Send an invitation through the custom-invite deeplink.
+
+        Returns a connection result, or ``None`` when LinkedIn did not open an
+        invite dialog for this vanityName — the caller decides how to report
+        that, because "no dialog" means different things on the write-gate
+        path (not connectable) and the incoming-request path (disproof).
+
+        WHY this is the write path now (2026-08-26): LinkedIn removed the
+        ``a[href*="/preload/custom-invite/?vanityName="]`` anchor from the
+        profile DOM. Measured zero such anchors on every profile tested,
+        including 2nd-degree cards showing a plainly visible, clickable
+        Connect button. Every gate keyed on that anchor therefore rejected
+        100% of sends, and ``connect_with_person`` could not send at all --
+        it returned ``connect_unavailable`` before ever opening the deeplink.
+        The deeplink itself still works and still opens the invite flow.
+
+        Identity safety is preserved WITHOUT the anchor: the deeplink URL
+        carries ``?vanityName=<username>``, so LinkedIn resolves it to exactly
+        the requested person. That is the same guarantee the anchor gave.
+
+        Do NOT "fix" this by relaxing the DOM selector to "any Connect
+        control". The sidebar ("Explore Premium profiles") renders Connect
+        anchors for OTHER people whose href points back at the current page,
+        so a loosened selector invites the wrong person. The deeplink URL is
+        the only identity-bearing signal left.
+        """
+        invite_url = (
+            "https://www.linkedin.com/preload/custom-invite/"
+            f"?vanityName={quote_plus(username)}"
+        )
+        await self._navigator._navigate_to_page(invite_url)
+
+        # Sendability gate: LinkedIn actually opening an invite dialog for
+        # this vanityName replaces the deleted anchor as the signal. Callers
+        # reach here only after already_connected and pending have returned,
+        # so an open dialog is not an existing relationship.
+        if not await self._dialog_is_open(timeout=5000):
+            return None
+
+        # Explicit pre-submit guardrail. A dialog opening is NOT by itself
+        # permission to send.
+        #
+        # For genuinely restricted / follow-only profiles LinkedIn still opens
+        # the invite dialog, but gates it on the recipient's email address and
+        # disables the send control. Verified live 2026-08-26 on
+        # williamhgates: the dialog reads "To verify this member knows you,
+        # please enter their email to connect", renders an email input, and
+        # "Send without a note" is disabled.
+        #
+        # Check that here rather than letting _submit_invite_dialog attempt a
+        # send and fail, so the write path is never entered for a profile
+        # LinkedIn will not let us invite. This is what preserves the
+        # follow-only guardrail now that the vanityName anchor -- the signal
+        # that guardrail used to rest on -- no longer exists.
+        if await self._invite_dialog_requires_email():
+            await self._dismiss_dialog()
+            return _connection_result(
+                url,
+                "manual_send_required",
+                "LinkedIn requires this person's email address before the "
+                "invitation can be sent. Send it manually.",
+                note_sent=False,
+                profile=page_text,
+            )
+
+        submitted, note_sent, note_limit_message = await self._submit_invite_dialog(
+            note
+        )
+        if note_limit_message is not None:
+            return _connection_result(
+                url,
+                "custom_note_limit_reached",
+                note_limit_message,
+                note_sent=False,
+                profile=page_text,
+            )
+        if not submitted:
+            if await self._invite_dialog_requires_email():
+                await self._dismiss_dialog()
+                return _connection_result(
+                    url,
+                    "manual_send_required",
+                    "LinkedIn requires this person's email address before the "
+                    "invitation can be sent. Send it manually.",
+                    note_sent=False,
+                    profile=page_text,
+                )
+            return _connection_result(
+                url,
+                "connect_unavailable",
+                "LinkedIn did not open a usable invite dialog for this profile.",
+                profile=page_text,
+            )
+
+        verified = await self._read_main_profile(username)
+        verified_signals = await self._read_action_signals(username)
+        if verified_signals.has_invite_anchor:
+            # The same settle retry as the accept path: an immediate re-read
+            # can still render Connect for an invitation LinkedIn already
+            # recorded (observed live 2026-09-26: send_failed, then Pending).
+            # Only a pending or already accepted invitation is evidence it
+            # landed.
+            await asyncio.sleep(3.0)
+            retry = await self._read_main_profile(username)
+            retry_signals = await self._read_action_signals(username)
+            if connection.detect_connection_state(retry_signals) in (
+                "pending",
+                "already_connected",
+            ):
+                verified, verified_signals = retry, retry_signals
+        verified_text = verified.get("sections", {}).get("main_profile", "")
+        verified_state = connection.detect_connection_state(verified_signals)
+
+        if verified_signals.has_invite_anchor:
+            return _connection_result(
+                url,
+                "send_failed",
+                "Submitted the invite dialog but the profile still exposes Connect.",
+                note_sent=note_sent,
+                profile=verified_text or page_text,
+            )
+
+        # Post-send verification, anchor-free.
+        #
+        # The historical check above ("still exposes Connect") is now vacuous:
+        # with the anchor deleted, has_invite_anchor is False for everyone, so
+        # it can never fire and would report success unconditionally. That is
+        # the dangerous direction -- a silent submit failure reported as
+        # `connected` writes a false dedup record and the person is never
+        # contacted again.
+        #
+        # `pending` is the surviving positive signal: LinkedIn renders it as an
+        # anchor carrying an aria-label, which detect_connection_state already
+        # reads locale-independently. It is not universal -- creator-mode /
+        # Follow-primary cards do NOT flip to Pending after a successful send
+        # (verified by hand 2026-08-26, mike-koh) -- so absence is not proof of
+        # failure. Report the distinction honestly instead of flattening it.
+        if verified_state == "pending":
+            message = "Connection request sent. Confirmed: profile now shows Pending."
+        elif verified_state == "already_connected":
+            # Reachable only via the settle retry above: the recipient
+            # accepted within the retry window. Stronger evidence than
+            # Pending, not a failure to confirm -- report it as such rather
+            # than falling into the "could not be positively confirmed" case
+            # below.
+            message = "Connection request sent. Confirmed: already connected."
+        else:
+            message = (
+                "Connection request sent, but the post-send state could not be "
+                "positively confirmed"
+                + (f" (state: {verified_state})" if verified_state else "")
+                + ". LinkedIn removed the invite anchor this check historically "
+                "relied on, and creator-mode cards do not flip to Pending. "
+                "Reconcile against the Sent invitation manager if certainty "
+                "matters."
+            )
+        return _connection_result(
+            url,
+            "connected",
+            message,
+            note_sent=note_sent,
+            profile=verified_text or page_text,
+        )
+
     async def connect_with_person(
         self,
         username: str,
@@ -1002,10 +1185,30 @@ class ConnectionActions:
             if note:
                 logger.info(
                     "Disproof found no invite anchor for %s and a note was "
-                    "requested; refusing to click Accept on a possible "
-                    "misclassification",
+                    "requested; trying the custom-invite deeplink instead of "
+                    "clicking Accept on a possible misclassification",
                     username,
                 )
+                # The disproof can no longer run on the anchor (deleted by
+                # LinkedIn 2026-08-26), so it comes back empty for EVERY
+                # creator-mode card and this branch used to refuse
+                # unconditionally -- which is why Follow-primary profiles
+                # returned "Could not confirm this is an incoming request"
+                # 100% of the time (verified live on ertugrul-sahin).
+                #
+                # The deeplink is a strictly safer disproof than refusing:
+                # if LinkedIn offers to SEND an invitation to this person,
+                # the card was not an incoming request, and sending is
+                # exactly what a note-bearing call asked for. Accept is
+                # irreversible and lands on the first labeled button
+                # (Follow) when misclassified; the deeplink cannot do that.
+                deeplink_result = await self._send_via_custom_invite_deeplink(
+                    url, username, note, page_text
+                )
+                if deeplink_result is not None:
+                    return deeplink_result
+                # No invite dialog either -- fall back to the original
+                # refusal rather than guessing at Accept.
                 return _connection_result(
                     url,
                     "send_failed",
@@ -1079,136 +1282,49 @@ class ConnectionActions:
                     logger.debug("Escape after More-menu reread failed", exc_info=True)
                 logger.info("Post-More signals for %s: signals=%s", username, signals)
 
-        invite_url = (
-            "https://www.linkedin.com/preload/custom-invite/"
-            f"?vanityName={quote_plus(username)}"
-        )
-
-        # Write-gate: submit only when LinkedIn exposed the vanityName invite
-        # anchor. When a note is requested without that anchor, open the
-        # deeplink only as a non-submitting probe so we can report the Premium
-        # note-quota block without accidentally sending from a follow-only or
-        # otherwise unavailable profile.
+        # Write-gate.
+        #
+        # Historically this required the vanityName invite anchor and returned
+        # connect_unavailable without it. LinkedIn deleted that anchor from the
+        # profile DOM on/around 2026-08-26, so the gate began rejecting 100% of
+        # sends -- every profile, including ones with a visible Connect button.
+        # The anchor is now treated as a fast path when present, and its
+        # absence falls back to the deeplink probe rather than failing closed.
+        #
+        # This is NOT a loosening of the safety property. already_connected and
+        # pending both return earlier, and the deeplink URL carries the
+        # vanityName, so LinkedIn still resolves the invite to exactly the
+        # requested person. See _send_via_custom_invite_deeplink for why a
+        # relaxed DOM selector would be the unsafe alternative.
         if not signals.has_invite_anchor:
-            if note:
-                logger.info(
-                    "No visible invite anchor for %s; probing custom-invite deeplink "
-                    "because a personalized note was requested",
-                    username,
-                )
-                await self._navigator._navigate_to_page(invite_url)
-                note_limit_message = await self._probe_invite_note_limit()
-                if note_limit_message is not None:
-                    return _connection_result(
-                        url,
-                        "custom_note_limit_reached",
-                        note_limit_message,
-                        note_sent=False,
-                        profile=page_text,
-                    )
-            return _connection_result(
-                url,
-                "connect_unavailable",
-                "LinkedIn did not expose a usable Connect action for this profile.",
-                profile=page_text,
-            )
-
-        await self._navigator._navigate_to_page(invite_url)
-
-        submitted, note_sent, note_limit_message = await self._submit_invite_dialog(
-            note
-        )
-        if note_limit_message is not None:
-            return _connection_result(
-                url,
-                "custom_note_limit_reached",
-                note_limit_message,
-                note_sent=False,
-                profile=page_text,
-            )
-        if not submitted:
-            # The deeplink is not universally honoured. On some profiles it
-            # renders no invite dialog even though the Connect control in the
-            # More menu works by hand — five such profiles verified live
-            # 2026-07-29. Fall back to clicking the anchor itself, which is
-            # the same URL the write-gate already matched on, so this widens
-            # the send path without widening what we are willing to click.
             logger.info(
-                "Deeplink opened no invite dialog for %s; falling back to "
-                "clicking the invite anchor",
+                "No visible invite anchor for %s; falling back to the "
+                "custom-invite deeplink probe",
                 username,
             )
-            await self._navigator._navigate_to_page(url)
-            if await self._click_invite_anchor(username):
-                (
-                    submitted,
-                    note_sent,
-                    note_limit_message,
-                ) = await self._submit_invite_dialog(note)
-                if note_limit_message is not None:
-                    return _connection_result(
-                        url,
-                        "custom_note_limit_reached",
-                        note_limit_message,
-                        note_sent=False,
-                        profile=page_text,
-                    )
-        if not submitted:
-            # Distinguish "LinkedIn wants more from the human" from a plain
-            # failure: some profiles gate the invite behind an email-address
-            # field that only the account owner can answer (angelosangelou,
-            # verified by hand 2026-07-29). Nothing should route around that
-            # gate, so report it as its own status and let the caller queue
-            # the person for a manual send.
-            if await self._invite_dialog_requires_email():
-                await self._dismiss_dialog()
+
+        deeplink_result = await self._send_via_custom_invite_deeplink(
+            url, username, note, page_text
+        )
+        if deeplink_result is not None:
+            return deeplink_result
+
+        # LinkedIn opened no invite dialog for this vanityName. When a note was
+        # requested, surface a Premium note-quota block if that is the reason
+        # (the deeplink is already the current page, so no re-navigation).
+        if note:
+            note_limit_message = await self._probe_invite_note_limit()
+            if note_limit_message is not None:
                 return _connection_result(
                     url,
-                    "manual_send_required",
-                    "LinkedIn requires this person's email address before the "
-                    "invitation can be sent. Send it manually.",
+                    "custom_note_limit_reached",
+                    note_limit_message,
                     note_sent=False,
                     profile=page_text,
                 )
-            return _connection_result(
-                url,
-                "connect_unavailable",
-                "LinkedIn did not open a usable invite dialog for this profile.",
-                profile=page_text,
-            )
-
-        verified = await self._read_main_profile(username)
-        verified_signals = await self._read_action_signals(username)
-        if verified_signals.has_invite_anchor:
-            # The same settle retry as the accept path: an immediate re-read
-            # can still render Connect for an invitation LinkedIn already
-            # recorded (observed live 2026-09-26: send_failed, then Pending).
-            # Only a pending or already accepted invitation is evidence it
-            # landed.
-            await asyncio.sleep(3.0)
-            retry = await self._read_main_profile(username)
-            retry_signals = await self._read_action_signals(username)
-            if connection.detect_connection_state(retry_signals) in (
-                "pending",
-                "already_connected",
-            ):
-                verified, verified_signals = retry, retry_signals
-        verified_text = verified.get("sections", {}).get("main_profile", "")
-        verified_state = connection.detect_connection_state(verified_signals)
-
-        if verified_signals.has_invite_anchor:
-            return _connection_result(
-                url,
-                "send_failed",
-                "Submitted the invite dialog but the profile still exposes Connect.",
-                note_sent=note_sent,
-                profile=verified_text or page_text,
-            )
-
         return _connection_result(
             url,
-            "connected",
-            f"Connection request sent. State after send: {verified_state}.",
-            note_sent=note_sent,
-            profile=verified_text or page_text,
+            "connect_unavailable",
+            "LinkedIn did not expose a usable Connect action for this profile.",
+            profile=page_text,
         )
