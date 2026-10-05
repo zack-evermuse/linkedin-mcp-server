@@ -27,6 +27,7 @@ from linkedin_mcp_server.linkedin.connection_actions import (
     _DIALOG_SELECTOR,
     _DIALOG_TEXTAREA_SELECTOR,
     _MODAL_OUTLET_SELECTOR,
+    _NOT_MESSAGING,
 )
 from linkedin_mcp_server.linkedin.navigation import PageNavigator
 from linkedin_mcp_server.linkedin.session import PageSession
@@ -1005,8 +1006,8 @@ class TestInviteDialog:
         assert _MODAL_OUTLET_SELECTOR in _DIALOG_PREMIUM_LINK_SELECTOR
         premium_link.wait_for.assert_awaited_once_with(state="visible", timeout=1234)
 
-    def test_every_dialog_selector_is_scoped_to_the_modal_outlet(self):
-        """Dialog selectors must never match outside LinkedIn's modal outlet.
+    def test_every_dialog_selector_excludes_chat_bubbles(self):
+        """No dialog selector branch may match a chat bubble outside the outlet.
 
         `[role="dialog"]` is not unique to modals: LinkedIn's messaging
         overlay renders every open chat bubble with that role. An unscoped
@@ -1019,9 +1020,11 @@ class TestInviteDialog:
         "Send". That is the "deeplink opens no dialog" defect, and it also
         put a real message-send control on the invite write path.
 
-        This is a guard against re-simplifying the scoping away. Each
-        comma-separated branch must carry the outlet prefix -- prefixing
-        only the first branch reopens the bug for the second.
+        Since the 2026-10-05 rebase a branch may be scoped either way: under
+        the modal outlet (this fork) or to dialogs without a composer
+        (upstream #1110). This guards against re-simplifying both away. Each
+        comma-separated branch must carry one -- restricting only the first
+        branch reopens the bug for the rest.
         """
         for name, selector in (
             ("_DIALOG_SELECTOR", _DIALOG_SELECTOR),
@@ -1029,13 +1032,16 @@ class TestInviteDialog:
             ("_DIALOG_TEXTAREA_SELECTOR", _DIALOG_TEXTAREA_SELECTOR),
             ("_DIALOG_EMAIL_INPUT_SELECTOR", _DIALOG_EMAIL_INPUT_SELECTOR),
         ):
-            branches = [b.strip() for b in selector.split(",")]
+            branches = [b.strip() for b in selector.split(", ")]
             assert branches, f"{name} is empty"
             for branch in branches:
-                assert branch.startswith(_MODAL_OUTLET_SELECTOR), (
-                    f"{name} branch {branch!r} is not scoped to "
-                    f"{_MODAL_OUTLET_SELECTOR}; it can match LinkedIn's "
-                    "messaging overlay chat bubbles"
+                dialog_part = branch.split(" ")[0]
+                assert branch.startswith(
+                    _MODAL_OUTLET_SELECTOR
+                ) or dialog_part.endswith(_NOT_MESSAGING), (
+                    f"{name} branch {branch!r} is neither scoped to "
+                    f"{_MODAL_OUTLET_SELECTOR} nor free of a composer; it can "
+                    "match LinkedIn's messaging overlay chat bubbles"
                 )
 
     async def test_reports_premium_after_add_note(self, mock_page):
