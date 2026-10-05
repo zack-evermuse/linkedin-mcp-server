@@ -957,16 +957,16 @@ class TestConnectWithPerson:
         read = _reads("text")
         actions = _actions(mock_page, read)
         # No-signals connection state falls through to the deeplink send
-        # path, which dismisses the dialog on the way out via
-        # page.keyboard.press("Escape"). Unset, mock_page's autospec
-        # MagicMock keyboard.press is not awaitable and raises TypeError --
-        # this test cares about normalization, not the send path it
-        # incidentally reaches.
-        mock_page.keyboard = MagicMock()
-        mock_page.keyboard.press = AsyncMock()
+        # path, which dismisses the dialog on the way out by pressing Escape.
+        # This test cares about normalization, not the send path it
+        # incidentally reaches, so the press itself is stubbed rather than
+        # whichever page API it currently goes through (it moved from
+        # page.keyboard to page.evaluate_handle upstream, which broke a
+        # keyboard-only mock here).
         seen: list[str] = []
 
         with (
+            patch.object(actions, "_press_escape", new_callable=AsyncMock),
             patch.object(
                 actions,
                 "_read_action_signals",
