@@ -49,8 +49,9 @@ from linkedin_mcp_server.linkedin.session import PageSession
 
 logger = logging.getLogger(__name__)
 
-# Every dialog selector below is scoped to LinkedIn's modal outlet, and that
-# scoping is load-bearing -- not tidiness.
+# Every dialog selector below accepts a dialog only if it is inside LinkedIn's
+# modal outlet OR carries no messaging composer, and that restriction is
+# load-bearing -- not tidiness.
 #
 # `[role="dialog"]` on its own is NOT unique to modals. LinkedIn's messaging
 # overlay renders each open chat bubble as a `[role="dialog"]` inside
@@ -73,33 +74,45 @@ logger = logging.getLogger(__name__)
 # profile-dependent only because it is really a race with overlay hydration.
 #
 # `aria-modal` is not usable as the discriminator -- LinkedIn does not set it
-# on the invite dialog (verified live). The outlet id is the available
-# structural signal, and it is locale-independent per the AGENTS.md Scraping
-# Rules: an element id, not layout classes and not UI copy. If LinkedIn ever
-# renames it, every helper here reports "no dialog" and callers fail closed
-# with connect_unavailable rather than clicking something unintended --
-# `_dialog_is_open` logs explicitly when that happens.
+# on the invite dialog (verified live). Two structural signals are, and each
+# selector accepts either one:
+#   - the modal outlet id (this fork, measured live 2026-07-29), and
+#   - the absence of a contenteditable composer (upstream #1110, measured
+#     live September 2026: the chat bubble's buttons are inside a composer
+#     form, so a dialog without one is not a chat bubble).
+# Both are locale-independent per the AGENTS.md rules: an element id and an
+# attribute, never layout classes or UI copy. The union exists because the
+# two fixes for the same bug met in the 2026-10-05 rebase: outlet-only failed
+# upstream's DOM fixtures (which render no outlet), and composer-only relies
+# on every chat bubble rendering its composer, which the two-bubble live case
+# above never confirmed. A dialog that matches neither -- a chat bubble outside
+# the outlet -- is never clicked. Do not drop either branch: each covers the
+# other's unverified case.
 _MODAL_OUTLET_SELECTOR = "#artdeco-modal-outlet"
-_DIALOG_SELECTOR = (
-    f'{_MODAL_OUTLET_SELECTOR} dialog[open], {_MODAL_OUTLET_SELECTOR} [role="dialog"]'
+_NOT_MESSAGING = ':not(:has([contenteditable="true"]))'
+_DIALOG_ROOTS = (
+    f"{_MODAL_OUTLET_SELECTOR} dialog[open]",
+    f'{_MODAL_OUTLET_SELECTOR} [role="dialog"]',
+    f"dialog[open]{_NOT_MESSAGING}",
+    f'[role="dialog"]{_NOT_MESSAGING}',
 )
-_DIALOG_PREMIUM_LINK_SELECTOR = (
-    f'{_MODAL_OUTLET_SELECTOR} dialog[open] a[href*="/premium/"], '
-    f'{_MODAL_OUTLET_SELECTOR} [role="dialog"] a[href*="/premium/"]'
-)
-_DIALOG_TEXTAREA_SELECTOR = (
-    f'{_MODAL_OUTLET_SELECTOR} [role="dialog"] textarea, '
-    f"{_MODAL_OUTLET_SELECTOR} dialog textarea"
-)
+
+
+def _in_invite_dialog(descendant: str = "") -> str:
+    """Return a selector for *descendant* inside any accepted invite dialog."""
+    suffix = f" {descendant}" if descendant else ""
+    return ", ".join(f"{root}{suffix}" for root in _DIALOG_ROOTS)
+
+
+_DIALOG_SELECTOR = _in_invite_dialog()
+_DIALOG_PREMIUM_LINK_SELECTOR = _in_invite_dialog('a[href*="/premium/"]')
+_DIALOG_TEXTAREA_SELECTOR = _in_invite_dialog("textarea")
 # LinkedIn gates some invitations behind the recipient's email address
 # ("we need to verify you know this person"). Detected by input *type*,
 # which is an HTML attribute value rather than UI copy, so it holds across
 # locales. Only the account owner can answer that prompt, so the tool
 # reports it instead of attempting to satisfy it.
-_DIALOG_EMAIL_INPUT_SELECTOR = (
-    f'{_MODAL_OUTLET_SELECTOR} [role="dialog"] input[type="email"], '
-    f'{_MODAL_OUTLET_SELECTOR} dialog input[type="email"]'
-)
+_DIALOG_EMAIL_INPUT_SELECTOR = _in_invite_dialog('input[type="email"]')
 # Any dialog anywhere, used only to tell "LinkedIn rendered nothing" apart
 # from "LinkedIn rendered a dialog somewhere we no longer recognise". Never
 # use this to click: that is exactly the bug described above.
@@ -421,18 +434,20 @@ class ConnectionActions:
             return True
         except Exception:
             pass
-        # No modal in the outlet. Distinguish "LinkedIn showed nothing" from
-        # "LinkedIn showed a dialog somewhere _MODAL_OUTLET_SELECTOR no
-        # longer covers" -- the second means this module's scoping has gone
-        # stale and every invite will fail closed until it is updated. That
-        # is worth a log line rather than a silent connect_unavailable.
+        # No accepted dialog. Distinguish "LinkedIn showed nothing" from
+        # "LinkedIn showed a dialog this module refuses" -- one outside the
+        # outlet that carries a composer. If that is the invite, the scoping
+        # has gone stale and every invite will fail closed until it is
+        # updated. That is worth a log line rather than a silent
+        # connect_unavailable.
         try:
             stray = await self._session.page.locator(_ANY_DIALOG_SELECTOR).count()
             if stray:
                 logger.warning(
-                    "No dialog inside %s, but %d dialog(s) exist elsewhere on "
-                    "the page. If invites are failing, LinkedIn may have moved "
-                    "the modal outlet and the selector needs updating.",
+                    "No invite dialog inside %s or free of a composer, but %d "
+                    "dialog(s) exist on the page. If invites are failing, "
+                    "LinkedIn may have changed its dialog markup and the "
+                    "selector needs updating.",
                     _MODAL_OUTLET_SELECTOR,
                     stray,
                 )
