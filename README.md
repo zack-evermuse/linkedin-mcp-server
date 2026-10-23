@@ -17,6 +17,14 @@ Give your AI agents access to LinkedIn through your own browser session. Read pr
 <details open>
 <summary><strong>LinkedIn MCP Sponsor</strong></summary>
 <br/>
+<a href="https://www.talktohumans.app/?utm_source=github&utm_medium=readme&utm_campaign=oss_sponsor&utm_content=banner" target="_blank">
+<img src="https://github.com/CoolSapiens/linkedin-mcp/raw/main/assets/banner.png" alt="LinkedIn MCP by TalkToHumans" width="100%">
+</a>
+
+> Want your agent to access LinkedIn safely? [**TalkToHumans**](https://www.talktohumans.app/?utm_source=github&utm_medium=readme&utm_campaign=oss_sponsor&utm_content=name) is a LinkedIn MCP that runs through your own browser, for Claude, ChatGPT, Codex, Cursor and n8n. Your agent reads your inbox, network and leads, and drafts messages you review before they go out.
+
+<br/>
+
 <a href="https://cadenza.page/?utm_source=github&amp;utm_medium=readme&amp;utm_campaign=oss_sponsor&amp;utm_content=banner" target="_blank">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="https://github.com/user-attachments/assets/e7dc04a7-4b2c-4f8f-bffa-77895f02a9b4">
