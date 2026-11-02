@@ -7,6 +7,7 @@ from ipaddress import IPv6Address, ip_address
 from typing import Literal
 from urllib.parse import parse_qs, urlparse
 
+
 from linkedin_mcp_server.linkedin.link_metadata import (
     JOB_PATH_RE,
     Reference,
@@ -185,6 +186,32 @@ RESULTS_PER_LINKEDIN_PAGE = 25
 # because `/jobs/search?keywords=x` is the same route and puts a `?` where a
 # prefix test wants the slash.
 JOB_SEARCH_PATHS = frozenset({"/jobs/search", "/jobs/search-results"})
+
+
+# LinkedIn's "Worldwide" location. A search without a location is not
+# unscoped: LinkedIn applies the account's remembered location, so a posting
+# listed elsewhere drops out of it.
+WORLDWIDE_GEO_ID = "92000000"
+
+# A posting's document title is "<card title> | <company> | LinkedIn", with
+# "(3) " in front while notifications are unread. The card title can itself
+# hold " | ", so the split runs from the right.
+_UNREAD_PREFIX_RE = re.compile(r"^\(\d+\+?\)\s*")
+
+
+def parse_posting_title(title: str) -> tuple[str, str] | None:
+    """The card title and company named by a job posting's document title.
+
+    None while the title has another shape, such as the bare "LinkedIn" shown
+    before the posting renders.
+    """
+    parts = _UNREAD_PREFIX_RE.sub("", title.strip()).rsplit(" | ", 2)
+    if len(parts) != 3 or parts[2].strip() != "LinkedIn":
+        return None
+    card_title, company = parts[0].strip(), parts[1].strip()
+    if not card_title or not company:
+        return None
+    return card_title, company
 
 
 def route(target: str) -> tuple[str, str]:
@@ -375,4 +402,22 @@ def apply_link_missing_section_error() -> dict[str, str]:
             "The Apply link names no employer address outside LinkedIn and "
             "this host's own network, so none is returned."
         ),
+    }
+
+
+EASY_APPLY_DRAFT_LEFT = (
+    "The Easy Apply dialog could not be closed and its draft discarded, so "
+    "LinkedIn may keep a saved application for this posting."
+)
+
+
+def easy_apply_draft_section_error() -> dict[str, str]:
+    """The ``section_errors`` entry for an Easy Apply dialog left open.
+
+    A saved draft is resumed, with whatever it holds, the next time Easy Apply
+    is opened on the posting, so the caller has to know one may exist.
+    """
+    return {
+        "error_type": "easy_apply_draft_left",
+        "error_message": EASY_APPLY_DRAFT_LEFT,
     }

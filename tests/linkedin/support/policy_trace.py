@@ -634,6 +634,9 @@ def semantic_selector_id(selector: str) -> str:
         "main": "main",
         "[role='menu']": "profile_more_menu",
         "main li label[aria-label]": "conversation_rows",
+        'li[data-occludable-job-id], [componentkey^="job-card-component-ref-"]': (
+            "job_search_cards"
+        ),
     }
     if selector in selectors:
         return selectors[selector]
@@ -673,11 +676,13 @@ def semantic_program_id(program: str) -> str:
         ("performance.timeOrigin", "document_origin"),
         ("element.ownerDocument.location.href", "owner_document_address"),
         ("MAX_HEADING_CONTAINERS", "root_content"),
+        ("collectPostBoundaries", "feed_post_boundaries"),
         ("SIDEBAR_SECTIONS", "sidebar_profiles"),
         ("showAllUrls", "sidebar_profiles"),
         ("hasInvite", "connection_action_signals"),
         ("expanded === 'false'", "open_more_button"),
         ("hasIncomingActionRow", "incoming_accept"),
+        ("threadParticipant", "thread_participant"),
         ("status === 'resolved'", "profile_message_target_ready"),
         ("const validComposeHref", "profile_message_target"),
         ("return inspect(target).status === 'valid'", "message_composer_ready"),
@@ -691,6 +696,10 @@ def semantic_program_id(program: str) -> str:
         ("const routeContinues", "message_confirmation_ready"),
         ("confirmations?.delete(arg.token)", "message_confirmation_dispose"),
         ("delete owner.__linkedinMcpComposer", "message_composer_dispose"),
+        ("names[0][0].setAttribute(mark", "thread_options"),
+        ("archiveItems[0].setAttribute(mark", "thread_menu_items"),
+        ("addedTotal: added.length", "thread_menu_survey"),
+        ("result.dismiss = dismiss.length", "job_search_card"),
         ("return {ids: ids, scoped", "job_ids"),
         ("promoted.push(id)", "job_promoted_ids"),
         ("signals.bounded && (signals.easy_apply", "job_apply_ready"),

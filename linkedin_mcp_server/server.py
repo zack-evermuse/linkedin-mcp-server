@@ -33,7 +33,7 @@ from linkedin_mcp_server.drivers.browser import (
     watch_for_handoff_requests,
 )
 from linkedin_mcp_server.daemon.auth_repair import OwnerAuthSignalMiddleware
-from linkedin_mcp_server.error_handler import raise_tool_error
+from linkedin_mcp_server.error_handler import ErrorCodeMiddleware, raise_tool_error
 from linkedin_mcp_server.sequential_tool_middleware import (
     SequentialToolExecutionMiddleware,
 )
@@ -42,6 +42,7 @@ from linkedin_mcp_server.server_role import (
     process_role,
     set_process_role,
 )
+from linkedin_mcp_server.session_status import session_status
 from linkedin_mcp_server.update_check import UpdateNoticeMiddleware
 from linkedin_mcp_server.tools.company import register_company_tools
 from linkedin_mcp_server.tools.feed import register_feed_tools
@@ -55,6 +56,25 @@ if TYPE_CHECKING:
     from linkedin_mcp_server.daemon.proxy import DaemonProxyBackend
 
 logger = logging.getLogger(__name__)
+
+
+# For clients that never load the plugin skill. Every client reads this on
+# every turn, so it holds only lines that measurably changed what cheap
+# client models did (Claude Haiku 5.5, GPT-5.6 Terra). Rules they already
+# follow unprompted, such as reading only what a request needs, are left out,
+# and a generic "retry once" made Haiku retry while setup was still running.
+_SERVER_INSTRUCTIONS = """\
+send_message and connect_with_person act for the user. Use them only for the
+exact action, recipient and text the user approved; when the user asks for a
+draft, or for something these tools cannot do, reply with the text instead. If
+a write's outcome is unknown, ask the user to check LinkedIn before acting
+again.
+
+Report what the tools returned, and say when a result may be incomplete.
+
+If LinkedIn waits for a captcha or other verification, ask the user to
+complete it in the browser, then continue when they say so.
+"""
 
 
 class _StaticTokenAuth(TokenVerifier):
@@ -216,6 +236,10 @@ def create_mcp_server(
     mcp = FastMCP(
         "mcp-server-linkedin",
         version=__version__,
+        # Before any role wiring, and not only on a role that drives a browser.
+        # A proxy registers no local tools, but it is the server the client
+        # initializes, so gating this would leave that client with no rules.
+        instructions=_SERVER_INSTRUCTIONS,
         # Selected here rather than gated inside, because for a proxy every step
         # of it is wrong: it would install a Chromium this process never opens,
         # and then claim to be closing a browser it never had.
@@ -223,6 +247,9 @@ def create_mcp_server(
         mask_error_details=True,
         auth=_StaticTokenAuth(auth_token) if auth_token is not None else None,
     )
+    # First, so it is the outermost layer on every role: everything inside it
+    # still sees a failure as the exception it raised.
+    mcp.add_middleware(ErrorCodeMiddleware())
     # Added before the serializing middleware below, which makes it the outer one.
     # An inner position would work: `close_browser` does not consult the in-flight
     # count, so quiescence succeeds from there, and the lease reference the inner
@@ -320,5 +347,26 @@ def create_mcp_server(
                 }
             except Exception as e:
                 raise_tool_error(e, "close_session")  # NoReturn
+
+        @mcp.tool(
+            timeout=tool_timeout,
+            title="Get Session Status",
+            annotations={"readOnlyHint": True, "openWorldHint": False},
+            tags={"session"},
+        )
+        async def get_session_status() -> dict[str, Any]:
+            """Report local saved-session and serving-process state for requested diagnostics.
+
+            Reads local observations without opening a browser, starting setup or login,
+            or contacting LinkedIn. Stored files do not prove current authentication.
+            In shared-browser mode these observations belong to the owner, not to a
+            frontend running a login. It answers during browser work without refreshing
+            the browser idle timer. Use ordinary LinkedIn tools directly for their
+            requested work rather than adding a status preflight.
+            """
+            try:
+                return session_status()
+            except Exception as e:
+                raise_tool_error(e, "get_session_status")  # NoReturn
 
     return mcp

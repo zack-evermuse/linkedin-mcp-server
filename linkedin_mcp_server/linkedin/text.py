@@ -253,6 +253,32 @@ _MESSAGING_CHROME_STRINGS: dict[str, _MessagingChromeTable] = {
 }
 
 
+@dataclass(frozen=True)
+class ConversationActionTextTable:
+    """Visible-text policy for acting on an opened conversation thread."""
+
+    # Start of the accessible name of a thread's options button, followed by
+    # the participants. The line the chrome table pins the thread header on;
+    # each sidebar row carries one too.
+    options_prefix: str
+    # Whole visible text of the options menu item that archives the thread,
+    # measured on 2026-10-15 on an inbox thread. The menu does not say whether
+    # the thread is archived: an archived thread opened by its URL offers
+    # Archive too, so the folder is read from LinkedIn's data instead.
+    archive_item: str
+
+
+_CONVERSATION_ACTION_TEXT: dict[str, ConversationActionTextTable] = {
+    "en-US": ConversationActionTextTable(
+        options_prefix=_MESSAGING_CHROME_STRINGS["en"].thread_header_prefix,
+        archive_item="Archive",
+    ),
+}
+
+# Same locale contract as `DETAIL_CAPTURE_EN_US`.
+CONVERSATION_ACTIONS_EN_US = _CONVERSATION_ACTION_TEXT["en-US"]
+
+
 def strip_conversation_chrome(text: str, locale: str = "en") -> str:
     """Trim messaging chrome around an opened conversation thread.
 
@@ -370,6 +396,11 @@ class JobSearchTextTable:
     # A sponsored card's own line. The detail pane says "Promoted by hirer",
     # which a whole-line match leaves alone.
     promoted_label: str
+    # The line the redesigned search puts between its matches and the
+    # related postings it pads the list with. It has no no-match page: a
+    # search matching nothing opens with this line under the promoted cards,
+    # and the cards after it are then all the page holds.
+    inexact_notices: tuple[str, ...]
 
     def shows_no_match(self, text: str) -> bool:
         """Whether a search page's text opens with a no-match heading.
@@ -379,6 +410,16 @@ class JobSearchTextTable:
         """
         first = next((line.strip() for line in text.splitlines() if line.strip()), "")
         return first in self.no_match_headings
+
+    def inexact_notice(self, text: str) -> str | None:
+        """The notice line ending a page's matches, if the text holds one.
+
+        A whole line, since a posting's own text could quote it in part.
+        """
+        for line in text.splitlines():
+            if line.strip() in self.inexact_notices:
+                return line.strip()
+        return None
 
     def result_count(self, text: str) -> tuple[int, bool] | None:
         """The advertised number of results, and whether it is exact.
@@ -405,6 +446,10 @@ _JOB_SEARCH_TEXT: dict[str, JobSearchTextTable] = {
             r"(?P<count>[0-9]{1,3}(?:,[0-9]{3})*)(?P<plus>\+)? results?"
         ),
         promoted_label="Promoted",
+        inexact_notices=(
+            "We found more results related to your search that may not be "
+            "exact matches, but could still be a great fit.",
+        ),
     ),
 }
 

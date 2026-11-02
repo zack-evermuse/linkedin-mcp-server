@@ -53,17 +53,21 @@ TOOL_DELEGATES = {
     "get_feed": "extract_feed",
     "get_inbox": "get_inbox",
     "get_job_apply_url": "get_job_apply_url",
+    "get_easy_apply_form": "get_easy_apply_form",
     "get_job_details": "read_job",
     "get_my_profile": "get_my_profile",
     "get_person_profile": "read_person",
     "get_saved_jobs": "get_saved_jobs",
+    "dismiss_job": "dismiss_job",
     "get_sidebar_profiles": "get_sidebar_profiles",
     "search_companies": "search_companies",
     "search_conversations": "search_conversations",
+    "archive_conversation": "archive_conversation",
     "search_jobs": "search_jobs",
     "search_people": "search_people",
     "search_posts": "search_posts",
     "send_message": "send_message",
+    "reply_to_conversation": "reply_to_conversation",
 }
 
 
@@ -124,9 +128,11 @@ async def test_registered_tools_match_extractor_delegates():
     tools = await create_mcp_server().list_tools()
     tool_names = {tool.name for tool in tools}
 
-    assert tool_names == {*TOOL_DELEGATES, "close_session"}
+    # The two session tools read no LinkedIn page, so neither has a delegate.
+    session_tools = {"close_session", "get_session_status"}
+    assert tool_names == {*TOOL_DELEGATES, *session_tools}
     assert set(TOOL_DELEGATES.values()) == TOOL_FACADE_METHODS
-    assert "close_session" not in TOOL_DELEGATES
+    assert not session_tools & set(TOOL_DELEGATES)
 
 
 async def test_company_posts_delegate_matches_registered_tool_consumer():
@@ -297,6 +303,24 @@ async def test_facade_search_posts_forwards_its_recency_filter(mock_page):
     assert "datePosted=%5B%22past-week%22%5D" in result["url"]
     with pytest.raises(FilterValidationError):
         await extractor.search_posts("unity", date_posted="last-year")
+
+
+async def test_facade_search_posts_forwards_its_content_type_filter(mock_page):
+    # Same boundary as the recency filter above: no trace passes a content
+    # type, so dropping the forward would otherwise survive the suite.
+    extractor = LinkedInExtractor(cast(Page, mock_page))
+
+    with patch.object(
+        SectionCapture,
+        "extract_page",
+        new_callable=AsyncMock,
+        return_value=ExtractedSection(text="post", references=[], error=None),
+    ):
+        result = await extractor.search_posts("unity", content_type="documents")
+
+    assert "contentType=%5B%22documents%22%5D" in result["url"]
+    with pytest.raises(FilterValidationError):
+        await extractor.search_posts("unity", content_type="articles")
 
 
 async def test_facade_search_jobs_forwards_every_filter_in_order(mock_page):

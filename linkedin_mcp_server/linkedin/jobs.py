@@ -22,7 +22,10 @@ from linkedin_mcp_server.linkedin.contracts import (
     rate_limited_section_error,
 )
 from linkedin_mcp_server.linkedin.identifiers import job_view_url, normalize_job_id
-from linkedin_mcp_server.linkedin.job_pages import JobPageReader
+from linkedin_mcp_server.linkedin.job_pages import (
+    EasyApplyDraftLeftError,
+    JobPageReader,
+)
 from linkedin_mcp_server.linkedin.job_policy import (
     JOB_SEARCH_PATHS,
     RESULTS_PER_LINKEDIN_PAGE,
@@ -32,10 +35,12 @@ from linkedin_mcp_server.linkedin.job_policy import (
     SCROLL_BUDGET_TOTAL,
     SCROLL_DEADLINE_MAX,
     SEARCH_TIMEOUT_FRACTION,
+    WORLDWIDE_GEO_ID,
     JobsTrackerStage,
     apply_link_missing_section_error,
     dropped_filters_section_error,
     dropped_offset_section_error,
+    easy_apply_draft_section_error,
     label_similar_jobs,
     lost_keywords_section_error,
     missing_description_section_error,
@@ -179,6 +184,50 @@ class JobReader:
             result["section_errors"] = {"apply": apply_link_missing_section_error()}
         return result
 
+    async def get_easy_apply_form(self, job_id: str) -> dict[str, Any]:
+        """Read the questions of a posting's Easy Apply form.
+
+        Returns:
+            {url, apply: {type}, form?: {steps, complete}}, with form present
+            for Easy Apply postings only, or {url, section_errors} when the
+            form could not be read. A draft left undiscarded is a section
+            error beside the form, or in place of it when the read failed too.
+        """
+        job_id = normalize_job_id(job_id)
+        url = job_view_url(job_id, "/")
+        try:
+            read = await self._pages.read_easy_apply_form(url, job_id, self._apply_text)
+        except LinkedInOperationError:
+            raise
+        except EasyApplyDraftLeftError as e:
+            logger.warning(
+                "Failed to read the Easy Apply form of %s: %s", url, e.__cause__
+            )
+            return {
+                "url": url,
+                "section_errors": {"form": easy_apply_draft_section_error()},
+            }
+        except Exception as e:
+            logger.warning("Failed to read the Easy Apply form of %s: %s", url, e)
+            return {
+                "url": url,
+                "section_errors": {
+                    "form": build_issue_diagnostics(
+                        e,
+                        context="get_easy_apply_form",
+                        target_url=url,
+                        section_name="form",
+                    )
+                },
+            }
+
+        result: dict[str, Any] = {"url": url, "apply": {"type": read.type}}
+        if read.type == "easy_apply":
+            result["form"] = {"steps": list(read.steps), "complete": read.complete}
+        if not read.discarded:
+            result["section_errors"] = {"form": easy_apply_draft_section_error()}
+        return result
+
     async def search_jobs(
         self,
         keywords: str,
@@ -210,7 +259,10 @@ class JobReader:
             sort_by: Sort results (date, relevance)
 
         Returns:
-            {url, sections: {search_results: text}, job_ids: [str]}
+            {url, sections: {search_results: text}, job_ids: [str],
+            pagination: {pages_fetched, next_offset, reason}}. ``pagination``
+            is absent when a failure stopped the search, which
+            ``section_errors`` then explains.
         """
         base_url = build_job_search_url(
             keywords,
@@ -240,6 +292,13 @@ class JobReader:
         # then cover only some of `job_ids`, and a caller takes a job missing
         # from it as not promoted.
         promoted_complete = True
+        # Why paging stopped, for every stop that is not a failure. A search
+        # the clock or `max_pages` cut short otherwise has exactly the shape
+        # of one that ran out of results, and only the caller knows whether
+        # asking again would help. Left unset by a failure, whose
+        # `section_errors` entry already says why the list ends there.
+        stop_reason: str | None = None
+        pages_fetched = 0
 
         # The search-wide scroll budget is spent as it goes rather than
         # divided up front, because dividing it charges every navigation for
@@ -271,6 +330,7 @@ class JobReader:
                     offset,
                     total_pages,
                 )
+                stop_reason = "complete"
                 break
 
             elapsed = time.monotonic() - started
@@ -283,6 +343,7 @@ class JobReader:
                     NAV_DELAY + slowest_page,
                     budget,
                 )
+                stop_reason = "time_budget"
                 break
 
             if page_num > 0:
@@ -316,6 +377,7 @@ class JobReader:
                     page_deadline=started + budget,
                 )
                 extracted = capture.section
+                pages_fetched += 1
                 slowest_page = max(slowest_page, time.monotonic() - page_started)
                 scroll_budget_left = max(
                     0.0, scroll_budget_left - capture.scroll_seconds
@@ -396,8 +458,9 @@ class JobReader:
                 # LinkedIn merely renamed would return nothing at all.
                 landed_query = parse_qs(parsed_url.query)
                 asked = parse_qs(urlparse(base_url).query)
-                is_no_match = bool(extracted.text) and self._search_text.shows_no_match(
-                    extracted.text
+                is_no_match = bool(extracted.text) and (
+                    self._search_text.shows_no_match(extracted.text)
+                    or await self._matches_none_before_notice(extracted.text)
                 )
                 asked_keywords = asked.get("keywords", [""])[0]
                 landed_keywords = landed_query.get("keywords", [""])[0]
@@ -450,6 +513,7 @@ class JobReader:
                     # The route and query survived, so this is a real empty
                     # result rather than a redirect that silently replaced the
                     # search. Do not read ids from a DOM that supplied no text.
+                    stop_reason = "complete"
                     break
 
                 if is_no_match:
@@ -467,6 +531,7 @@ class JobReader:
                         section_errors["search_results"] = (
                             no_matching_jobs_section_error(keywords)
                         )
+                    stop_reason = "complete"
                     break
 
                 if page_num == 0:
@@ -508,6 +573,7 @@ class JobReader:
                     if page_refs:
                         page_references.extend(page_refs)
                     logger.debug("No new job IDs on page %d, stopping", page_num + 1)
+                    stop_reason = "no_new_ids"
                     break
 
                 # Best effort, like the page count: a read that fails costs the
@@ -545,6 +611,8 @@ class JobReader:
                     section_name="search_results",
                 )
                 break
+        else:
+            stop_reason = "max_pages"
 
         result: dict[str, Any] = {
             "url": base_url,
@@ -576,7 +644,40 @@ class JobReader:
                 )
         if section_errors:
             result["section_errors"] = section_errors
+        if stop_reason is not None:
+            result["pagination"] = {
+                "pages_fetched": pages_fetched,
+                "next_offset": offset,
+                "reason": stop_reason,
+            }
         return result
+
+    async def _matches_none_before_notice(self, text: str) -> bool:
+        """Whether the redesigned search put no result above its notice.
+
+        That search has no no-match page. A query matching nothing renders
+        the promoted cards, then the notice saying what follows may not be an
+        exact match, then a full page of unrelated postings, under "99+
+        results" like any other search. Measured live on a nonsense query:
+        three promoted cards above the notice. A narrow query put 24 cards
+        above it, and the broad ones never showed it.
+
+        False when the read fails or finds no notice, which keeps the page,
+        as every search was read before.
+        """
+        notice = self._search_text.inexact_notice(text)
+        if notice is None:
+            return False
+        try:
+            organic = await self._pages._count_organic_before_notice(
+                notice, self._search_text.promoted_label
+            )
+        except LinkedInOperationError:
+            raise
+        except Exception as e:
+            logger.debug("Could not read results above the notice: %s", e)
+            return False
+        return organic == 0
 
     async def get_saved_jobs(
         self, max_pages: int = 3, stage: JobsTrackerStage = "saved"
@@ -767,3 +868,60 @@ class JobReader:
         if section_errors:
             result["section_errors"] = section_errors
         return result
+
+    async def dismiss_job(self, job_id: str) -> dict[str, Any]:
+        """Dismiss a job from job search, so later searches no longer show it.
+
+        Acts on the job's card in the first page of a worldwide search for
+        the title and company its posting names, which has to list it: a
+        search by `currentJobId` shows the job only in the detail pane, which
+        has no dismiss control. Worldwide, because a search without a location
+        is scoped to the account's remembered one. The card turning to its
+        undo state is not yet a change LinkedIn kept, so the search is loaded
+        again and must not list the job either, while rendering the other
+        cards it showed before. Irreversible: the undo is
+        offered only in place, before any reload.
+
+        A dismissed job and a search that missed it look the same, since
+        neither lists the job, so a job the search does not list is an error
+        naming both.
+
+        Returns:
+            {url, job_id, keywords, dismissed: True, already_dismissed}
+        """
+        job_id = normalize_job_id(job_id)
+        card_title, company = await self._pages.read_posting_title(job_id)
+        keywords = f"{card_title} {company}"
+        url = f"{build_job_search_url(keywords)}&geoId={WORLDWIDE_GEO_ID}"
+        await asyncio.sleep(NAV_DELAY)
+        outcome, cards = await self._pages.dismiss_search_card(url, job_id)
+        if outcome == "absent":
+            raise LinkedInOperationError(
+                f"Job {job_id} is not on the first page of a worldwide search "
+                f"for {keywords!r}. Either it is already dismissed, or that "
+                "search does not list it on its first page."
+            )
+        if outcome == "no_button":
+            raise LinkedInOperationError(
+                f"Job {job_id} is in the search results, but its dismiss button "
+                "could not be found."
+            )
+        if outcome == "not_dismissed":
+            raise LinkedInOperationError(
+                f"The dismiss button of job {job_id} was clicked, but its card "
+                "did not change."
+            )
+        if outcome == "dismissed":
+            await asyncio.sleep(NAV_DELAY)
+            if await self._pages.search_lists_job(url, job_id, cards - 1):
+                raise LinkedInOperationError(
+                    f"Job {job_id} was dismissed, but it was back in the search "
+                    "after a reload."
+                )
+        return {
+            "url": url,
+            "job_id": job_id,
+            "keywords": keywords,
+            "dismissed": True,
+            "already_dismissed": outcome == "already_dismissed",
+        }

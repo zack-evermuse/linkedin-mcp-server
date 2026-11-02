@@ -65,25 +65,30 @@ Use code <strong>FOUNDING20</strong> for 20% off your first year. <a href="https
 
 | Tool | Description |
 |------|-------------|
-| `get_person_profile` | Read profile sections such as experience, education, skills, projects, and posts. |
+| `get_person_profile` | Read profile sections such as experience, education, skills, projects, volunteering, and posts. |
 | `get_my_profile` | Read your own profile, with the same section selection as other profiles. |
 | `connect_with_person` | Send a connection request with an optional note, or accept an incoming one. |
 | `get_sidebar_profiles` | Find recommended profile links, including people you may know. |
 | `get_inbox` | List recent inbox conversations, with links to open individual threads. |
 | `get_conversation` | Read a conversation's messages using a LinkedIn username or thread ID. |
 | `search_conversations` | Search messages by keyword and return links to matching conversation threads. |
+| `archive_conversation` | Archive a conversation by thread ID; a repeat call reports it already archived. |
 | `send_message` | Send after confirmation; profile targets may open a new DM ([#483](https://github.com/stickerdaniel/linkedin-mcp-server/issues/483)). |
+| `reply_to_conversation` | Reply inside an existing thread by thread ID, InMail included. Sends after confirmation. |
 | `get_company_profile` | Read company information, with optional sections for posts and open jobs. |
 | `get_company_posts` | Read recent posts from a company's feed, with links to the original posts. |
 | `search_companies` | Find companies by keyword and return links to their LinkedIn profiles. |
 | `get_company_employees` | Find company employees, optionally filtered by name, title, or skill. |
 | `search_jobs` | Find job postings by keyword and location, with job IDs for reading details. |
 | `get_saved_jobs` | List your saved job postings, with job IDs for looking up their details. |
+| `dismiss_job` | Dismiss a job from job search so later searches no longer show it. Irreversible. |
 | `search_people` | Find people by keyword, location, connection degree, and current company. |
 | `get_job_details` | Read a job posting's description, requirements, and company details. |
 | `get_job_apply_url` | Check whether a job uses Easy Apply or links to an employer's application. |
+| `get_easy_apply_form` | Read an Easy Apply form: each field's label, type, options and prefilled value. Never types or submits. |
 | `get_feed` | Read recent posts from your home feed, with links to the original posts. |
-| `search_posts` | Search posts by keyword, optionally limited to the past day, week, or month. |
+| `search_posts` | Search posts by keyword, optionally filtered by recency or content type. |
+| `get_session_status` | Check your saved login and browser state without opening a browser. |
 | `close_session` | Close the shared browser session without deleting your saved login. |
 
 <br/>
@@ -353,6 +358,14 @@ On startup, the MCP Bundle prepares the shared Patchright Chromium browser cache
 </details>
 
 <details>
+<summary>Use your own Chrome</summary>
+
+- Set **Chrome executable** in the extension's settings to a Chrome, Chromium or Chrome for Testing binary, such as `/usr/bin/google-chrome`. Leave it blank to keep the bundled Chromium. It sets `CHROME_PATH`, described under *Custom Chrome path* in the uvx setup help.
+- This is the fix when tool calls refuse to open the profile because a newer browser last opened it: point the setting at that newer browser instead of signing in again.
+
+</details>
+
+<details>
 <summary>Told to run <code>--login</code> on the host when you already did</summary>
 
 - If tool calls answer "No valid LinkedIn session is available in Docker" on a machine that is *not* a container, the runtime was misdetected. This happened on Linux hosts running a Docker daemon for unrelated services. Set `LINKEDIN_MCP_CONTAINER=false` to override the detection; `true` forces the opposite.
@@ -461,7 +474,7 @@ docker run -it --rm `
   --login --login-viewer
 ```
 
-Open the full URL the command prints (it carries the access token) and sign in. The viewer closes itself afterwards; let the command exit on its own so the session is stored completely. It gives up after 30 minutes.
+Open the full URL the command prints (it carries the access token) and sign in. Ctrl+V (Cmd+V on a Mac) pastes plain ASCII text, such as a password from your password manager, into the login browser. The viewer closes itself afterwards; let the command exit on its own so the session is stored completely. It gives up after 30 minutes.
 
 Keep the same host directory mounted at `/home/pwuser/.linkedin-mcp` on every later `docker run`, otherwise the server cannot find the session.
 

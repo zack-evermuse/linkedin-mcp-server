@@ -80,6 +80,23 @@ _THE_OWNER_IS_GONE = (
 )
 
 
+#: The rules initialize hands a client. Written here, not imported from the
+#: server: the contract is this text, including the write-authorization rule
+#: and the user-owned verification step.
+_THE_OPERATING_RULES = """\
+send_message and connect_with_person act for the user. Use them only for the
+exact action, recipient and text the user approved; when the user asks for a
+draft, or for something these tools cannot do, reply with the text instead. If
+a write's outcome is unknown, ask the user to check LinkedIn before acting
+again.
+
+Report what the tools returned, and say when a result may be incomplete.
+
+If LinkedIn waits for a captcha or other verification, ask the user to
+complete it in the browser, then continue when they say so.
+"""
+
+
 def _no_replacement_to_find(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -310,6 +327,21 @@ class TestServerRoles:
             # role arrives, for the entirely legitimate reason that one does
             # not, which is a test failing at the wrong thing.
             assert serializes == role.drives_browser, role
+
+    def test_the_error_code_is_the_outermost_layer_on_every_role(self):
+        # It turns a failure into a result, so every layer it wraps still sees
+        # the exception: the owner's auth marker walks its causes, and the update
+        # notice is only ever appended to a result.
+        from linkedin_mcp_server.error_handler import ErrorCodeMiddleware
+
+        for role in ServerRole:
+            ours = [
+                middleware
+                for middleware in _server_for(role).middleware
+                if type(middleware).__module__.startswith("linkedin_mcp_server")
+            ]
+
+            assert isinstance(ours[0], ErrorCodeMiddleware), role
 
     def test_the_update_notice_goes_only_where_a_user_reads_it(self):
         # Appended to one tool result per process, so it belongs wherever a user
@@ -1191,6 +1223,38 @@ class TestBrowserLifespan:
                 raise RuntimeError("boom")
 
         close_browser.assert_awaited_once()
+
+
+class TestServerInstructions:
+    """Every client is told how to use LinkedIn, plugin or not.
+
+    The skill never reaches uvx, Docker, MCPB, or an install link, and a
+    client on the daemon proxy talks to a process that registers no tools of
+    its own. Both eras are read through ``Client.instructions``: a legacy
+    handshake carries them on ``InitializeResult``, while auto negotiates
+    ``server/discover`` and has no initialize result to read.
+    """
+
+    @pytest.mark.parametrize("role", list(ServerRole))
+    @_BOTH_ERAS
+    async def test_every_role_sends_the_same_operating_rules(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        role: ServerRole,
+        mode: str,
+        protocol: str,
+    ):
+        _stand_in_the_lifespan(monkeypatch)
+
+        async with Client(_server_for(role), mode=mode) as client:
+            assert client.protocol_version == protocol
+            # Legacy initialization returns the rules on the handshake itself.
+            # Modern mode raises from initialize(); Client.instructions is the
+            # access both eras populate.
+            if mode == "legacy":
+                handshake = await client.initialize()
+                assert handshake.instructions == _THE_OPERATING_RULES
+            assert client.instructions == _THE_OPERATING_RULES
 
 
 class TestServerVersion:

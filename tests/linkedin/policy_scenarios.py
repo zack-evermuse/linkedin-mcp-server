@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncGenerator, Generator
 from contextlib import asynccontextmanager, contextmanager
 from difflib import unified_diff
 from pathlib import Path
@@ -102,7 +102,7 @@ class TraceCallbacks(ProgressCallback):
 
 
 @contextmanager
-def _diagnostics_bindings(diagnostics: Any) -> Iterator[None]:
+def _diagnostics_bindings(diagnostics: Any) -> Generator[None]:
     """Bind the issue-report boundary in each exercised linkedin module.
 
     A separate context manager rather than more items in `boundaries`, which
@@ -130,7 +130,7 @@ async def boundaries(
     clock: FakeClock,
     *,
     auth_result: str | None = None,
-) -> AsyncIterator[None]:
+) -> AsyncGenerator[None]:
     real_scroll_body = session_module.scroll_to_bottom
     real_scroll_sidebar = session_module.scroll_job_sidebar
     real_drain = feed_module.FeedReader._drain_listener_tasks
@@ -307,7 +307,7 @@ async def _person_sections_scenario() -> dict[str, Any]:
         "filter:^Show (more|all)\\b/re.IGNORECASE|re.UNICODE",
         "show_more.filtered",
     )
-    page.script("show_more.filtered.count", *([0] * 8))
+    page.script("show_more.filtered.count", *([0] * 9))
     extractor = _extractor(page)
     callbacks = TraceCallbacks(recorder)
     async with boundaries(recorder, clock):
@@ -392,6 +392,37 @@ async def _job_search_scenario(route: str = "/jobs/search/") -> dict[str, Any]:
         {"method": "search_jobs", "arguments": {"keywords": "python", "max_pages": 1}},
         result,
     )
+
+
+async def _dismiss_job_scenario() -> dict[str, Any]:
+    recorder = TraceRecorder("dismiss_job__dismissed", _COMMON_ALLOWED | {"title"})
+    clock = FakeClock(recorder)
+    page = _page(recorder)
+    posting = "https://www.linkedin.com/jobs/view/123/"
+    search = (
+        "https://www.linkedin.com/jobs/search/"
+        "?keywords=Applied+AI+Engineer+Acme&geoId=92000000"
+    )
+    page.goto_landings.extend([posting, search, search])
+    page.script("title", "LinkedIn", "(3) Applied AI Engineer | Acme | LinkedIn")
+    page.declare_locator("button[data-mcp-dismiss]", "search_card_dismiss")
+    page.script(
+        "evaluate:job_search_card",
+        {"cards": 25, "matches": 1, "dismiss": 1, "undo": 0},
+        {"cards": 25, "matches": 1, "dismiss": 0, "undo": 1},
+        # The reload lists the other jobs, and only that makes the job's
+        # absence a confirmation.
+        {"cards": 24, "matches": 0, "dismiss": 0, "undo": 0},
+        {"cards": 24, "matches": 0, "dismiss": 0, "undo": 0},
+    )
+    page.script("search_card_dismiss.click", None)
+    extractor = _extractor(page)
+    arguments = {"job_id": "123"}
+    async with boundaries(recorder, clock):
+        with recorder.context("dismiss_job"):
+            result = await extractor.dismiss_job(**arguments)
+    page.assert_clean()
+    return recorder.trace({"method": "dismiss_job", "arguments": arguments}, result)
 
 
 async def _job_search_upgrade_scenario() -> dict[str, Any]:
@@ -510,6 +541,7 @@ async def _feed_stale_scenario() -> dict[str, Any]:
     recorder = TraceRecorder(name, _COMMON_ALLOWED)
     clock = FakeClock(recorder)
     page = _page(recorder).script("evaluate:root_content", _root("Feed content"))
+    page.script("evaluate:feed_post_boundaries", {"posts": []})
     extractor = _extractor(page)
     async with boundaries(recorder, clock):
         with recorder.context("extract_feed", "feed"):
@@ -543,6 +575,7 @@ async def _feed_response_scenario(*, body_failure: bool) -> dict[str, Any]:
         body,
     )
     page.script("mouse.wheel", lambda: page.emit("response", response))
+    page.script("evaluate:feed_post_boundaries", {"posts": []})
     extractor = _extractor(page)
     async with boundaries(recorder, clock):
         with recorder.context("extract_feed", "feed"):
@@ -835,6 +868,52 @@ async def _invalid_message_scenario(message: str, label: str) -> dict[str, Any]:
     )
 
 
+_REPLY_THREAD_ROUTE = "https://www.linkedin.com/messaging/thread/2-policy-thread==/"
+
+
+async def _reply_scenario(outcome: str) -> dict[str, Any]:
+    recorder = TraceRecorder(f"reply_to_conversation__{outcome}", _COMMON_ALLOWED)
+    clock = FakeClock(recorder)
+    page = _page(recorder)
+    if outcome == "other_thread":
+        page.goto_landings.append(
+            "https://www.linkedin.com/messaging/thread/2-other-thread/"
+        )
+    else:
+        page.goto_landings.append(_REPLY_THREAD_ROUTE)
+        page.script("wait_for_function:message_composer_ready", None)
+        states = (_VALID_COMPOSER,) * (1 if outcome == "dry_run" else 2)
+        page.script("evaluate:message_composer_state", *states)
+        page.script("evaluate:thread_participant", "Ada Lovelace")
+    if outcome == "sent":
+        _script_message_owner(page)
+        page.script("handle-1.evaluate:message_submit_ready", "ready")
+        page.script("evaluate:message_confirmation_prepare", "confirmation-1")
+        page.script("handle-1.evaluate:message_submit", "clicked")
+        page.script(
+            "wait_for_function:message_confirmation_ready",
+            {"path": "/messaging/thread/2-policy-thread==/"},
+        )
+        _script_confirmation_cleanup(page)
+    extractor = _extractor(page)
+    arguments = {
+        "thread_id": "2-policy-thread==",
+        "message": "New text",
+        "confirm_send": outcome == "sent",
+    }
+    async with boundaries(recorder, clock):
+        with recorder.context("reply_to_conversation", "message"):
+            result = await extractor.reply_to_conversation(
+                arguments["thread_id"],
+                arguments["message"],
+                confirm_send=arguments["confirm_send"],
+            )
+    page.assert_clean()
+    return recorder.trace(
+        {"method": "reply_to_conversation", "arguments": arguments}, result
+    )
+
+
 async def _single_capture_facade_scenario(method: str) -> dict[str, Any]:
     name = f"{method}__baseline"
     recorder = TraceRecorder(name, _COMMON_ALLOWED)
@@ -921,6 +1000,24 @@ async def _job_apply_scenario() -> dict[str, Any]:
     page.assert_clean()
     return recorder.trace(
         {"method": "get_job_apply_url", "arguments": arguments}, result
+    )
+
+
+async def _easy_apply_form_scenario() -> dict[str, Any]:
+    recorder = TraceRecorder("get_easy_apply_form__closed", _COMMON_ALLOWED)
+    clock = FakeClock(recorder)
+    page = _page(recorder).script(
+        "evaluate:job_apply_signals",
+        {"easy_apply": False, "external_link": None, "applied": False, "closed": True},
+    )
+    extractor = _extractor(page)
+    arguments = {"job_id": "123"}
+    async with boundaries(recorder, clock):
+        with recorder.context("get_easy_apply_form"):
+            result = await extractor.get_easy_apply_form(**arguments)
+    page.assert_clean()
+    return recorder.trace(
+        {"method": "get_easy_apply_form", "arguments": arguments}, result
     )
 
 
@@ -1025,6 +1122,75 @@ async def _conversation_scenario(method: str) -> dict[str, Any]:
     )
 
 
+THREAD_OPTIONS = {
+    "triggers": 1,
+    "name": "Open the options list in your conversation with Ada Lovelace",
+}
+
+
+CONVERSATIONS_RESPONSE_URL = (
+    "https://www.linkedin.com/voyager/api/voyagerMessagingGraphQL/graphql"
+    "?queryId=messengerConversations.policy&variables=(conversationIds:List(2-abc))"
+)
+
+
+def _conversation_payload(*categories: str) -> bytes:
+    """The conversations query's answer for thread ``2-abc`` in ``categories``."""
+    conversation = {
+        "_type": "com.linkedin.messenger.Conversation",
+        "backendUrn": "urn:li:messagingThread:2-abc",
+        "categories": list(categories),
+    }
+    return json.dumps(
+        {"data": {"messengerConversationsByIds": [conversation]}}
+    ).encode()
+
+
+async def _archive_conversation_scenario(*, already: bool) -> dict[str, Any]:
+    """Archive a thread, or find it archived and leave its menu untouched."""
+    outcome = "already_archived" if already else "archived"
+    recorder = TraceRecorder(
+        f"archive_conversation__{outcome}",
+        _COMMON_ALLOWED | {"response.body.start", "response.body.finish"},
+    )
+    clock = FakeClock(recorder)
+    page = _page(recorder)
+    thread = "https://www.linkedin.com/messaging/thread/2-abc/"
+    folders = [("ARCHIVE",)] if already else [("INBOX", "PRIMARY_INBOX"), ("ARCHIVE",)]
+    page.goto_landings.extend([thread] * len(folders))
+    page.script(
+        "goto",
+        *(
+            lambda folder=folder: page.emit(
+                "response",
+                ScriptedResponse(
+                    recorder,
+                    CONVERSATIONS_RESPONSE_URL,
+                    _conversation_payload(*folder),
+                ),
+            )
+            for folder in folders
+        ),
+    )
+    page.script("evaluate:thread_options", THREAD_OPTIONS)
+    if not already:
+        page.declare_locator("main button[data-mcp-thread-options]", "thread_options")
+        page.declare_locator("[data-mcp-thread-archive]", "thread_archive_item")
+        page.script("evaluate:thread_menu_survey", {"seen": 0})
+        page.script("thread_options.click", None)
+        page.script("evaluate:thread_menu_items", {"archive": 1})
+        page.script("thread_archive_item.click", None)
+    extractor = _extractor(page)
+    arguments = {"thread_id": "2-abc"}
+    async with boundaries(recorder, clock):
+        with recorder.context("archive_conversation"):
+            result = await extractor.archive_conversation(**arguments)
+    page.assert_clean()
+    return recorder.trace(
+        {"method": "archive_conversation", "arguments": arguments}, result
+    )
+
+
 ROW_CLICK_STOPPED_OUTCOME = {
     "rows": [
         {"ariaLabel": "Select conversation with Ada Lovelace", "threadId": "2-ada"}
@@ -1095,10 +1261,12 @@ async def _facade_contract_trace() -> dict[str, Any]:
 
 TOOL_FACADE_METHODS = {
     "connect_with_person",
+    "dismiss_job",
     "extract_feed",
     "extract_page",
     "get_company_employees",
     "get_conversation",
+    "get_easy_apply_form",
     "get_inbox",
     "get_job_apply_url",
     "get_my_profile",
@@ -1109,10 +1277,12 @@ TOOL_FACADE_METHODS = {
     "read_person",
     "search_companies",
     "search_conversations",
+    "archive_conversation",
     "search_jobs",
     "search_people",
     "search_posts",
     "send_message",
+    "reply_to_conversation",
 }
 COMPATIBILITY_METHODS = {"get_page_text", "click_button_by_text"}
 
@@ -1143,6 +1313,7 @@ async def build_policy_traces() -> dict[str, dict[str, Any]]:
         ),
         "job-search-metadata-upgrade.json": await _job_search_upgrade_scenario(),
         "saved-jobs.json": await _saved_jobs_scenario(),
+        "dismiss-job.json": await _dismiss_job_scenario(),
         "feed-stale.json": await _feed_stale_scenario(),
         "feed-response-success.json": await _feed_response_scenario(body_failure=False),
         "feed-response-failure.json": await _feed_response_scenario(body_failure=True),
@@ -1175,6 +1346,9 @@ async def build_policy_traces() -> dict[str, dict[str, Any]]:
         "message-blank.json": await _invalid_message_scenario("   ", "blank"),
         "message-c0.json": await _invalid_message_scenario("before\tafter", "c0"),
         "message-del.json": await _invalid_message_scenario("text\x7f", "del"),
+        "reply-dry-run.json": await _reply_scenario("dry_run"),
+        "reply-sent.json": await _reply_scenario("sent"),
+        "reply-other-thread.json": await _reply_scenario("other_thread"),
         "connect.json": await _connect_scenario(),
         "get-my-profile.json": await _get_my_profile_scenario(),
         "sidebar-profiles.json": await _sidebar_scenario(),
@@ -1185,6 +1359,7 @@ async def build_policy_traces() -> dict[str, dict[str, Any]]:
         "read-job-error.json": await _single_capture_error_scenario(),
         "read-job-description-missing.json": await _description_missing_scenario(),
         "job-apply-url.json": await _job_apply_scenario(),
+        "easy-apply-form.json": await _easy_apply_form_scenario(),
         "search-people.json": await _single_capture_facade_scenario("search_people"),
         "search-companies.json": await _single_capture_facade_scenario(
             "search_companies"
@@ -1197,6 +1372,12 @@ async def build_policy_traces() -> dict[str, dict[str, Any]]:
         ),
         "conversation-row-resolution.json": (
             await _conversation_row_resolution_scenario()
+        ),
+        "archive-conversation.json": await _archive_conversation_scenario(
+            already=False
+        ),
+        "archive-conversation-already.json": await _archive_conversation_scenario(
+            already=True
         ),
     }
     return traces

@@ -8,13 +8,17 @@ diagnostics that decide what a page *means* stay with the workflow.
 
 from __future__ import annotations
 
+from contextlib import suppress
 from dataclasses import dataclass
+from typing import Any, Literal
 
 import asyncio
 import logging
 import re
 import time
+from urllib.parse import parse_qs, urlparse
 
+import anyio
 from patchright.async_api import TimeoutError as PlaywrightTimeoutError
 
 from linkedin_mcp_server.core.exceptions import LinkedInOperationError
@@ -33,15 +37,18 @@ from linkedin_mcp_server.linkedin.contracts import (
     RATE_LIMITED_SECTION_TEXT,
     ExtractedSection,
 )
+from linkedin_mcp_server.linkedin.identifiers import job_view_url
 from linkedin_mcp_server.linkedin.job_policy import (
+    EASY_APPLY_DRAFT_LEFT,
     SAFETY_REDIRECT_PATH,
     SCROLL_DEADLINE_MAX,
     ApplyType,
     employer_apply_url,
+    parse_posting_title,
     route,
     same_job_search,
 )
-from linkedin_mcp_server.linkedin.link_metadata import build_references
+from linkedin_mcp_server.linkedin.link_metadata import JOB_PATH_RE, build_references
 from linkedin_mcp_server.linkedin.navigation import PageNavigator
 from linkedin_mcp_server.linkedin.session import PageSession
 from linkedin_mcp_server.linkedin.text import (
@@ -141,6 +148,61 @@ PROMOTED_JOB_IDS_JS = (
 }"""
 )
 
+# How many unpromoted results sit above the notice the redesigned search puts
+# where its matches end, or null when nothing on the page reads as the notice.
+# Null rather than zero, because zero is what calls the search a no-match. The
+# notice is looked for in the whole document, the cards only in the rail,
+# each read as `PROMOTED_JOB_IDS_JS` reads it.
+#
+# The notice is the smallest element whose text is the whole sentence, reached
+# from a text node that opens it, so a sentence LinkedIn splits across inline
+# elements is still found. Its text only matched when it was one text node,
+# and a page whose notice was split then kept its unrelated postings.
+ORGANIC_BEFORE_NOTICE_JS = (
+    r"""(opts) => {
+    const {selector, label, notice} = opts;
+"""
+    + _RAIL_PICK_JS
+    + r"""
+    const scope = pickRail() || document;
+    const cardOf = (node) => {
+        let card = node;
+        while (card.parentElement && card.parentElement !== scope
+               && card.parentElement !== document.body
+               && idsIn(card.parentElement) === 1) {
+            card = card.parentElement;
+        }
+        return card;
+    };
+    const isPromoted = (node) => (cardOf(node).innerText || '').split('\n')
+        .map((line) => line.trim()).includes(label);
+    const norm = (text) => (text || '').replace(/\s+/g, ' ').trim();
+    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+    let mark = null;
+    while (!mark && walker.nextNode()) {
+        const piece = norm(walker.currentNode.data);
+        if (!piece || !notice.startsWith(piece)) continue;
+        let node = walker.currentNode;
+        while (node && norm(node.textContent).length < notice.length) {
+            node = node.parentNode;
+        }
+        if (node && norm(node.textContent) === notice) mark = node;
+    }
+    if (!mark) return null;
+    const seen = new Set();
+    let organic = 0;
+    for (const node of scope.querySelectorAll(selector)) {
+        const id = idOf(node);
+        if (!id || seen.has(id)) continue;
+        seen.add(id);
+        const above = mark.compareDocumentPosition(node)
+            & Node.DOCUMENT_POSITION_PRECEDING;
+        if (above && !isPromoted(node)) organic += 1;
+    }
+    return organic;
+}"""
+)
+
 # This posting's apply control and state, once they render. Easy Apply comes in
 # two shapes. The anchor into the posting's own `/apply/` route
 # (`<a href=".../jobs/view/<id>/apply/?openSDUIApplyFlow=true">`, measured on
@@ -222,6 +284,145 @@ APPLY_READY_JS = (
 
 # How long the apply control gets to render.
 _APPLY_READY_TIMEOUT = 10.0
+_APPLY_POLL = 0.25
+
+# The Easy Apply dialog renders inside an open shadow root, which
+# `querySelectorAll` from the document never enters, so the programs below walk
+# the open roots first. Playwright locators pierce them on their own. The dialog
+# is told apart from others by an Easy Apply control inside it, and every button
+# by a LinkedIn data attribute rather than by its localized label.
+_EASY_APPLY_DIALOG_JS = r"""
+    const roots = [document];
+    for (let i = 0; i < roots.length; i++) {
+        for (const el of roots[i].querySelectorAll('*')) {
+            if (el.shadowRoot) roots.push(el.shadowRoot);
+        }
+    }
+    const marker = '[data-easy-apply-next-button], '
+        + '[data-live-test-easy-apply-submit-button], [id*="easyApplyFormElement"]';
+    let dialog = null;
+    for (const root of roots) {
+        dialog = [...root.querySelectorAll('[role="dialog"]')]
+            .find((candidate) => candidate.querySelector(marker));
+        if (dialog) break;
+    }
+"""
+
+EASY_APPLY_OPEN_JS = (
+    "() => {" + _EASY_APPLY_DIALOG_JS + "    return Boolean(dialog);\n}"
+)
+EASY_APPLY_CLOSED_JS = "() => !(" + EASY_APPLY_OPEN_JS + ")()"
+
+# One step of the open dialog. Radios and checkboxes are grouped into one field
+# per question; every other control is its own field. Footer controls (follow
+# the company) are not questions, and a file input is read although hidden
+# behind its upload button. `signature` changes when the step does.
+EASY_APPLY_STEP_JS = (
+    "(maxOptions) => {"
+    + _EASY_APPLY_DIALOG_JS
+    + r"""
+    if (!dialog) return null;
+    const form = dialog.querySelector('form') || dialog;
+    const footer = form.querySelector('footer');
+    const shown = (el) => Boolean(
+        el.offsetWidth || el.offsetHeight || el.getClientRects().length
+    );
+    // Labels repeat their text in an aria-hidden copy.
+    const text = (el) => {
+        if (!el) return '';
+        const copy = el.cloneNode(true);
+        copy.querySelectorAll('[aria-hidden="true"]').forEach((node) => node.remove());
+        return (copy.textContent || '').replace(/\s+/g, ' ').trim();
+    };
+    const byId = (id) => form.querySelector(`[id="${CSS.escape(id)}"]`);
+    const labelOf = (el) =>
+        (el.id && text(form.querySelector(`label[for="${CSS.escape(el.id)}"]`)))
+        || text(el.closest('label'))
+        || (el.getAttribute('aria-label') || '').trim();
+    const isChoice = (el) => el.type === 'radio' || el.type === 'checkbox';
+    const controls = [...form.querySelectorAll('input, select, textarea')].filter(
+        (el) => !(footer && footer.contains(el))
+            && el.type !== 'hidden'
+            && (el.type === 'file' || shown(el))
+    );
+    const groups = new Map();
+    for (const el of controls) {
+        const key = isChoice(el)
+            ? (el.closest('fieldset, [data-test-form-element]') || el)
+            : el;
+        if (!groups.has(key)) groups.set(key, []);
+        groups.get(key).push(el);
+    }
+    const fields = [];
+    for (const [key, group] of groups) {
+        const first = group[0];
+        const fieldset = first.closest('fieldset');
+        const field = {
+            label: text(fieldset && fieldset.querySelector('legend'))
+                || (group.length === 1 ? labelOf(first) : '')
+                || (key === first ? '' : text(key).slice(0, 300)),
+            type: first.tagName === 'SELECT' ? 'select'
+                : first.tagName === 'TEXTAREA' ? 'textarea'
+                : first.getAttribute('role') === 'combobox' ? 'typeahead'
+                : first.type || 'text',
+            required: group.some(
+                (el) => el.required || el.getAttribute('aria-required') === 'true'
+            ) || Boolean(fieldset && fieldset.getAttribute('aria-required') === 'true'),
+        };
+        if (first.tagName === 'SELECT') {
+            const options = [...first.options].map((option) => option.text.trim());
+            field.options = options.slice(0, maxOptions);
+            if (options.length > maxOptions) field.options_total = options.length;
+            const picked = first.options[first.selectedIndex];
+            if (picked) field.value = picked.text.trim();
+        } else if (isChoice(first)) {
+            const options = group.map(labelOf);
+            field.options = options.slice(0, maxOptions);
+            if (options.length > maxOptions) field.options_total = options.length;
+            field.selected = group.filter((el) => el.checked).map(labelOf);
+        } else if (first.type !== 'file' && first.value) {
+            field.value = first.value;
+        }
+        if (first.maxLength > 0) field.max_length = first.maxLength;
+        // Hints are described too. Which text is an error is the walk's to
+        // say, by what a refused Next added (`_refused_step`).
+        const errors = group
+            .flatMap((el) => (el.getAttribute('aria-describedby') || '').split(/\s+/))
+            .filter(Boolean)
+            .map((id) => text(byId(id)))
+            .filter(Boolean);
+        if (errors.length) field.error = [...new Set(errors)].join(' ');
+        fields.push(field);
+    }
+    const heading = dialog.querySelector('h3');
+    const progress = dialog.querySelector('progress');
+    const value = progress && progress.getAttribute('value');
+    return {
+        heading: text(heading),
+        progress: value === null ? null : Number(value),
+        fields,
+        next: Boolean(dialog.querySelector('[data-easy-apply-next-button]')),
+        signature: [text(heading), value, ...controls.map((el) => el.id || el.type)]
+            .join('\n'),
+    };
+}"""
+)
+
+EASY_APPLY_NEXT_SELECTOR = "[data-easy-apply-next-button]"
+EASY_APPLY_DISCARD_SELECTOR = '[data-control-name="discard_application_confirm_btn"]'
+
+_EASY_APPLY_OPEN_TIMEOUT = 10.0
+_EASY_APPLY_STEP_TIMEOUT = 8.0
+_EASY_APPLY_DISCARD_TIMEOUT = 5.0
+# How long closing the dialog may hold the page once the walk has ended, a
+# cancelled walk included: the wait for a dialog still opening, Escape, the
+# Discard click and the wait for the dialog to go, with room for the reads
+# between them.
+_EASY_APPLY_CLOSE_GRACE = 4 * _EASY_APPLY_DISCARD_TIMEOUT
+_EASY_APPLY_MAX_STEPS = 8
+# A country list runs to 250 options; the prefilled value is still reported.
+# A radio or checkbox group is cut the same way, and keeps every option checked.
+_EASY_APPLY_MAX_OPTIONS = 50
 
 
 @dataclass(frozen=True, slots=True)
@@ -230,6 +431,156 @@ class JobApplyRead:
 
     type: ApplyType
     url: str | None = None
+
+
+# A search result card and its dismiss control, in both of LinkedIn's job
+# searches, measured on signed-in en-US accounts. The job named only by
+# `currentJobId` sits in the detail pane, which has no card and no dismiss
+# control.
+#
+# - Classic `/jobs/search/` (2026-09-28): each result is an
+#   `li[data-occludable-job-id]` holding the job id. The dismiss control is
+#   the card's `button` around an icon with `data-test-icon="close-small"`
+#   (some cards also carry a "More options" button around
+#   `overflow-web-ios-small`).
+# - Redesigned `/jobs/search-results/` (2026-10-14): each result is an element
+#   whose `componentkey` is `job-card-component-ref-<job id>`, with a nested
+#   element repeating that key, so only the outermost counts. The dismiss
+#   control is its `button` around `svg#close-small`.
+#
+# In both, clicking it keeps the card and swaps the button for one around
+# `undo-small`, which is the only undo there is: a reload drops the job from
+# that search and every later one. Applied jobs carry the same control. The
+# button's `aria-label` names the job in the account's language and is never
+# read. More than one card for the id, or more than one dismiss button in it,
+# is refused rather than guessed at.
+SEARCH_CARD_JS = r"""(opts) => {
+    const {jobId, mark} = opts;
+    for (const old of document.querySelectorAll('[' + mark + ']')) {
+        old.removeAttribute(mark);
+    }
+    const refKey = '[componentkey^="job-card-component-ref-"]';
+    const classic = [...document.querySelectorAll('li[data-occludable-job-id]')];
+    const redesigned = [...document.querySelectorAll(refKey)].filter(
+        (card) => !card.parentElement || !card.parentElement.closest(refKey)
+    );
+    const idOf = (card) => card.getAttribute('data-occludable-job-id')
+        ?? card.getAttribute('componentkey').slice('job-card-component-ref-'.length);
+    const cards = [...classic, ...redesigned];
+    const own = cards.filter((card) => idOf(card) === jobId);
+    const result = {cards: cards.length, matches: own.length, dismiss: 0, undo: 0};
+    if (own.length !== 1) return result;
+    const card = own[0];
+    // Occluded cards render their content only near the viewport.
+    card.scrollIntoView({block: 'center'});
+    const around = (icon) => [...card.querySelectorAll('button')].filter(
+        (button) => button.querySelector(
+            '[data-test-icon="' + icon + '"], svg#' + icon
+        )
+    );
+    const dismiss = around('close-small');
+    result.dismiss = dismiss.length;
+    result.undo = around('undo-small').length;
+    if (dismiss.length === 1) dismiss[0].setAttribute(mark, '');
+    return result;
+}"""
+
+_SEARCH_CARD_SELECTOR = (
+    'li[data-occludable-job-id], [componentkey^="job-card-component-ref-"]'
+)
+# The job search parameters a landed search has to keep by value: what the
+# search is about and where. The worldwide `geoId` is ours, never a location
+# string LinkedIn turns into one, so its value is comparable.
+_SEARCH_VALUE_PARAMS = frozenset({"keywords", "geoId"})
+_DISMISS_MARK = "data-mcp-dismiss"
+
+# How long a search gets to render its cards, a found card its buttons, and a
+# clicked card its undo state.
+_SEARCH_READY_TIMEOUT = 10.0
+_SEARCH_CARD_RENDER_TIMEOUT = 5.0
+_DISMISS_TIMEOUT = 5.0
+# How long a posting gets to set its "<title> | <company> | LinkedIn" title.
+_POSTING_TITLE_TIMEOUT = 10.0
+_SEARCH_POLL = 0.25
+
+SearchCardOutcome = Literal[
+    # The dismiss button was clicked and the card turned to its undo state.
+    "dismissed",
+    # The card is already in its undo state.
+    "already_dismissed",
+    # No card for the job in the search's results, scrolled to the end.
+    "absent",
+    # The card is there but no single dismiss button could be told to be its.
+    "no_button",
+    # The button was clicked and the card did not change.
+    "not_dismissed",
+]
+
+
+@dataclass(frozen=True, slots=True)
+class EasyApplyFormRead:
+    """A posting's apply type and, for Easy Apply, the form steps read.
+
+    `complete` is False when steps after the last one were not read, and
+    `discarded` is False when the dialog could not be closed, which may leave a
+    saved draft on LinkedIn.
+    """
+
+    type: ApplyType
+    steps: tuple[dict[str, Any], ...] = ()
+    complete: bool = False
+    discarded: bool = True
+
+
+class EasyApplyDraftLeftError(RuntimeError):
+    """A walk failed and its dialog could not be closed after it.
+
+    Raised in place of the failure, which it chains, because the draft it may
+    leave on LinkedIn is what the caller has to act on, and an error of its own
+    type keeps that warning's `error_type` instead of the failure's.
+    """
+
+
+def _added_errors(before: dict[str, Any], after: dict[str, Any]) -> list[str | None]:
+    """Per field of ``after``, the error text a click on ``before`` added.
+
+    Both reads are of one step, so their fields line up. The text a field
+    describes itself with is LinkedIn's error only when the click put it
+    there: `aria-describedby` also names hints, and a hint is there before
+    any click. Nothing in the markup tells the two apart in every locale; the
+    click does.
+    """
+    return [
+        field.get("error") if field.get("error") != prior.get("error") else None
+        for field, prior in zip(after["fields"], before["fields"], strict=True)
+    ]
+
+
+def _refused_step(before: dict[str, Any], after: dict[str, Any]) -> dict[str, Any]:
+    """``after``, the step LinkedIn kept after Next, with only its new errors."""
+    fields = []
+    for field, error in zip(after["fields"], _added_errors(before, after), strict=True):
+        field = {key: value for key, value in field.items() if key != "error"}
+        if error:
+            field["error"] = error
+        fields.append(field)
+    return {**after, "fields": fields}
+
+
+def _unrefused_step(step: dict[str, Any]) -> dict[str, Any]:
+    """``step`` without errors, for a step no click has been refused on."""
+    return _refused_step(step, step)
+
+
+def _public_step(step: dict[str, Any]) -> dict[str, Any]:
+    """One read step as returned to the caller, without the walk's bookkeeping."""
+    public: dict[str, Any] = {}
+    if step["heading"]:
+        public["heading"] = step["heading"]
+    if step["progress"] is not None:
+        public["progress"] = step["progress"]
+    public["fields"] = step["fields"]
+    return public
 
 
 @dataclass(frozen=True, slots=True)
@@ -322,6 +673,184 @@ class JobPageReader:
         a stranger's link, or any redirect behind it, send a request from this
         host to whatever the host can reach.
         """
+        kind, link = await self._read_apply_type(url, job_id, text)
+        if kind == "external" and link is not None:
+            return JobApplyRead("external", employer_apply_url(link))
+        return JobApplyRead(kind)
+
+    async def read_easy_apply_form(
+        self, url: str, job_id: str, text: JobApplyTextTable
+    ) -> EasyApplyFormRead:
+        """Read an Easy Apply form step by step without answering it.
+
+        Any posting that is not Easy Apply answers with its type alone. Next is
+        clicked while LinkedIn accepts a step on its prefilled values, and the
+        first step it refuses ends the read. Nothing is typed, because LinkedIn
+        saves Easy Apply answers and prefills them into later applications.
+        The dialog is then closed and the draft it offers to save discarded.
+        """
+        kind, _ = await self._read_apply_type(url, job_id, text)
+        if kind != "easy_apply":
+            return EasyApplyFormRead(kind)
+
+        steps: list[dict[str, Any]] = []
+        try:
+            complete = await self._walk_easy_apply(job_id, steps)
+        except asyncio.CancelledError:
+            # A cancel can land between the click on Easy Apply and the dialog
+            # rendering, and the click goes on without the task that sent it.
+            await self._close_easy_apply(opening=True)
+            raise
+        except Exception as e:
+            if not await self._close_easy_apply():
+                raise EasyApplyDraftLeftError(EASY_APPLY_DRAFT_LEFT) from e
+            raise
+        discarded = await self._close_easy_apply()
+        return EasyApplyFormRead("easy_apply", tuple(steps), complete, discarded)
+
+    async def _walk_easy_apply(self, job_id: str, steps: list[dict[str, Any]]) -> bool:
+        """Open the dialog and read its steps into ``steps``; True when all were read."""
+        page = self._session.page
+        await page.locator(f'main a[href*="/jobs/view/{job_id}/apply"]').first.click(
+            timeout=5000
+        )
+        try:
+            await page.wait_for_function(
+                EASY_APPLY_OPEN_JS, timeout=_EASY_APPLY_OPEN_TIMEOUT * 1000
+            )
+        except PlaywrightTimeoutError:
+            raise RuntimeError("The Easy Apply dialog did not open") from None
+
+        step = await self._read_easy_apply_step(None)
+        while True:
+            # Nothing has been asked of this step yet, so nothing on it is an
+            # answer to a click.
+            steps.append(_public_step(_unrefused_step(step)))
+            if not step["next"]:
+                return True
+            if len(steps) >= _EASY_APPLY_MAX_STEPS:
+                return False
+            # The only control ever clicked in the dialog. Found by its
+            # attribute: a one-step form holds Submit in the same footer slot.
+            await page.locator(EASY_APPLY_NEXT_SELECTOR).click(timeout=5000)
+            after = await self._read_easy_apply_step(step)
+            if after["signature"] == step["signature"]:
+                # Refused: the same step, now carrying LinkedIn's errors.
+                steps[-1] = _public_step(_refused_step(step, after))
+                return False
+            step = after
+
+    async def _read_easy_apply_step(
+        self, previous: dict[str, Any] | None
+    ) -> dict[str, Any]:
+        """The step the dialog settles on after ``previous``.
+
+        Settled means two reads in a row agree, and they differ from
+        ``previous`` or carry an error ``previous`` did not. A step that does
+        neither by the deadline is returned as it stands. Text a field already
+        described itself with is a hint, and settling on it would take a step
+        that Next is still moving off for a refused one.
+        """
+        page = self._session.page
+        deadline = self._session.monotonic() + _EASY_APPLY_STEP_TIMEOUT
+        last: dict[str, Any] | None = None
+        while True:
+            step = await page.evaluate(EASY_APPLY_STEP_JS, _EASY_APPLY_MAX_OPTIONS)
+            if step is None:
+                raise RuntimeError("The Easy Apply dialog closed while it was read")
+            moved = previous is None or step["signature"] != previous["signature"]
+            refused = not moved and any(_added_errors(previous, step))
+            if (
+                last is not None
+                and last["signature"] == step["signature"]
+                and (moved or refused)
+            ):
+                return step
+            if self._session.monotonic() >= deadline:
+                return step
+            last = step
+            await self._session.delay(_APPLY_POLL)
+
+    async def _close_easy_apply(self, *, opening: bool = False) -> bool:
+        """Discard the dialog however the walk ended; True once it is gone.
+
+        Shielded from AnyIO as well as from asyncio, for the reason
+        `_let_the_scroll_land` is: a tool timeout cancels the task again on
+        every pass of the event loop, and would end the discard at its first
+        await with the dialog still open on the shared page and a draft that
+        LinkedIn resumes the next time Easy Apply is opened. Bounded by
+        `_EASY_APPLY_CLOSE_GRACE`, so a page that never answers cannot hold
+        the page lock. A cancel that arrives meanwhile is raised once the
+        discard has ended.
+
+        ``opening`` gives a dialog that is not open yet a moment to open first,
+        for a walk cancelled after its click on Easy Apply was sent.
+        """
+        grace = _EASY_APPLY_DISCARD_TIMEOUT if opening else 0.0
+        close = asyncio.ensure_future(self._discard_easy_apply(grace))
+        cancel: asyncio.CancelledError | None = None
+        until = time.monotonic() + _EASY_APPLY_CLOSE_GRACE
+        with anyio.CancelScope(shield=True):
+            while not close.done() and time.monotonic() < until:
+                try:
+                    await asyncio.wait({close}, timeout=until - time.monotonic())
+                except asyncio.CancelledError as e:
+                    cancel = e
+        if close.done():
+            discarded = close.result()
+        else:
+            logger.warning(
+                "The Easy Apply dialog was not closed within %.0fs",
+                _EASY_APPLY_CLOSE_GRACE,
+            )
+            close.cancel()
+            discarded = False
+        if cancel is not None:
+            raise cancel
+        # A deadline that expired inside the shield is delivered here, so a
+        # walk that ends past it does not report a result.
+        await anyio.lowlevel.checkpoint()
+        return discarded
+
+    async def _discard_easy_apply(self, opening_grace: float = 0.0) -> bool:
+        """Close the Easy Apply dialog and discard its draft; True once it is gone.
+
+        Escape rather than the dialog's close button, which other dialogs carry
+        too. LinkedIn answers with "Save this application?", and only its
+        Discard, found by attribute, is clicked. A dialog that is not open is
+        waited for up to ``opening_grace`` seconds before it counts as gone.
+        """
+        page = self._session.page
+        try:
+            if not await page.evaluate(EASY_APPLY_OPEN_JS):
+                if not opening_grace:
+                    return True
+                try:
+                    await page.wait_for_function(
+                        EASY_APPLY_OPEN_JS, timeout=opening_grace * 1000
+                    )
+                except PlaywrightTimeoutError:
+                    return True
+            await page.keyboard.press("Escape")
+            with suppress(PlaywrightTimeoutError):
+                await page.locator(EASY_APPLY_DISCARD_SELECTOR).first.click(
+                    timeout=_EASY_APPLY_DISCARD_TIMEOUT * 1000
+                )
+            await page.wait_for_function(
+                EASY_APPLY_CLOSED_JS, timeout=_EASY_APPLY_DISCARD_TIMEOUT * 1000
+            )
+            return True
+        except Exception as e:
+            logger.warning("Could not discard the Easy Apply dialog (%s)", e)
+            return False
+
+    async def _read_apply_type(
+        self, url: str, job_id: str, text: JobApplyTextTable
+    ) -> tuple[ApplyType, str | None]:
+        """Open the posting and read its apply type, without clicking anything.
+
+        An external posting comes with its Apply link's href.
+        """
         await self._navigator._navigate_to_page(url)
         await self._session.check_rate_limit()
         page = self._session.page
@@ -345,19 +874,17 @@ class JobPageReader:
         # Both states before any control, so a posting in either never reads
         # as open.
         if signals and signals["applied"]:
-            return JobApplyRead("applied")
+            return "applied", None
         if signals and signals["closed"]:
-            return JobApplyRead("closed")
+            return "closed", None
         if signals and signals["easy_apply"]:
-            return JobApplyRead("easy_apply")
+            return "easy_apply", None
         if signals and signals["external_link"]:
-            return JobApplyRead(
-                "external", employer_apply_url(signals["external_link"])
-            )
+            return "external", signals["external_link"]
         # A barrier served in place of the posting renders none of the above
         # either, and it needs the relogin path rather than a type.
         await self._navigator._raise_if_auth_barrier(url)
-        return JobApplyRead("unknown")
+        return "unknown", None
 
     async def _extract_job_ids(self, *, scoped: bool = False) -> list[str]:
         """Extract unique job IDs from job card links on the current page.
@@ -398,6 +925,23 @@ class JobPageReader:
         if not isinstance(result, list):
             raise TypeError(f"Promoted job ids read returned {type(result).__name__}")
         return [job_id for job_id in result if isinstance(job_id, str)]
+
+    async def _count_organic_before_notice(self, notice: str, label: str) -> int | None:
+        """Unpromoted results above ``notice``, or None without the notice.
+
+        Raises when the page answers with anything else, so a caller treating
+        this as best effort cannot read a failed read as zero, which would
+        discard the page as a no-match.
+        """
+        result = await self._session.run_on_linkedin(
+            ORGANIC_BEFORE_NOTICE_JS,
+            {"selector": _JOB_CARD_SELECTOR, "label": label, "notice": notice},
+        )
+        if result is None:
+            return None
+        if isinstance(result, bool) or not isinstance(result, int):
+            raise TypeError(f"Organic results read returned {type(result).__name__}")
+        return result
 
     async def _extract_search_page(
         self,
@@ -810,3 +1354,168 @@ class JobPageReader:
             }"""
         )
         return int(value) if value is not None else None
+
+    async def read_posting_title(self, job_id: str) -> tuple[str, str]:
+        """Open ``job_id``'s posting and read its card title and company.
+
+        Both come from the document title, which LinkedIn sets once the
+        posting renders. Raises when the navigation ends anywhere but that
+        posting, after offering the page to the auth-barrier check, or when
+        the title never takes that shape.
+        """
+        url = job_view_url(job_id, "/")
+        await self._navigator._navigate_to_page(url)
+        await self._session.check_rate_limit()
+        page = self._session.page
+        landed = JOB_PATH_RE.match(route(page.url)[1])
+        if landed is None or landed.group(1) != job_id:
+            await self._navigator._raise_if_auth_barrier(page.url)
+            raise LinkedInOperationError(
+                f"The navigation to job {job_id}'s posting ended on {page.url}"
+            )
+        deadline = self._session.monotonic() + _POSTING_TITLE_TIMEOUT
+        while True:
+            title = await page.title()
+            parsed = parse_posting_title(title)
+            if parsed is not None:
+                return parsed
+            if self._session.monotonic() >= deadline:
+                raise LinkedInOperationError(
+                    f"Job {job_id}'s posting never named its title and company: "
+                    f"its page title read {title!r}"
+                )
+            await self._session.delay(_SEARCH_POLL)
+
+    async def _open_job_search(self, url: str) -> None:
+        """Navigate to a job search and wait for its result cards to render.
+
+        Raises when the navigation ends anywhere but a job search, after
+        offering the page to the auth-barrier check, or on a search that lost
+        part of its query: a redirect to the bare search page keeps the route
+        and drops the query whole, and its results are an answer to another
+        question. The keywords and `geoId` are compared by value, since a
+        search with other words or in another place is not the one asked
+        for, and the other parameters by presence, as `search_jobs` does,
+        since LinkedIn re-encodes some of them. `currentJobId`, which LinkedIn
+        appends by itself, was never asked for and is not compared. A search with no results
+        renders no card, so that wait ends in silence.
+        """
+        await self._navigator._navigate_to_page(url)
+        await self._session.check_rate_limit()
+        page = self._session.page
+        if not same_job_search(route(url), route(page.url)):
+            await self._navigator._raise_if_auth_barrier(page.url)
+            raise LinkedInOperationError(
+                f"The job search navigation ended on {page.url}"
+            )
+        asked = parse_qs(urlparse(url).query)
+        landed = parse_qs(urlparse(page.url).query)
+        lost = sorted(
+            name
+            for name in asked
+            if not landed.get(name)
+            or (name in _SEARCH_VALUE_PARAMS and landed[name][0] != asked[name][0])
+        )
+        if lost:
+            raise LinkedInOperationError(
+                f"The job search lost its {', '.join(lost)} on the way to {page.url}"
+            )
+        await self._session.dismiss_modal()
+        try:
+            await page.wait_for_selector(
+                _SEARCH_CARD_SELECTOR,
+                state="attached",
+                timeout=int(_SEARCH_READY_TIMEOUT * 1000),
+            )
+        except PlaywrightTimeoutError:
+            logger.debug("No result card rendered on %s", url)
+
+    async def _find_search_card(self, job_id: str) -> dict[str, int]:
+        """Count ``job_id``'s cards and buttons, and mark its dismiss button."""
+        found = await self._session.page.evaluate(
+            SEARCH_CARD_JS, {"jobId": job_id, "mark": _DISMISS_MARK}
+        )
+        if not isinstance(found, dict):
+            raise LinkedInOperationError("The job search page could not be read")
+        return found
+
+    async def _locate_search_card(self, job_id: str) -> dict[str, int]:
+        """Find ``job_id``'s card, scrolling the rail once when it is not there.
+
+        A found card is polled until its buttons render, since an occluded
+        card is empty until it nears the viewport. A scroll that
+        raised leaves the rest of the rail unread, so it is an error rather
+        than a job the search does not list.
+        """
+        found = await self._find_search_card(job_id)
+        if not found["matches"]:
+            if await self._session.scroll_job_sidebar(deadline=SCROLL_DEADLINE_MAX):
+                raise LinkedInOperationError(
+                    "The job search results could not be scrolled to the end"
+                )
+            found = await self._find_search_card(job_id)
+        deadline = self._session.monotonic() + _SEARCH_CARD_RENDER_TIMEOUT
+        while (
+            found["matches"] == 1
+            and not (found["dismiss"] or found["undo"])
+            and self._session.monotonic() < deadline
+        ):
+            await self._session.delay(_SEARCH_POLL)
+            found = await self._find_search_card(job_id)
+        return found
+
+    async def search_lists_job(self, url: str, job_id: str, min_cards: int = 1) -> bool:
+        """Whether the job search at ``url`` shows a card for ``job_id``.
+
+        Only a search that rendered other cards can say the job is not among
+        them: a reload that rendered none, blank or still loading, raises
+        instead, since reading it as "not listed" would confirm a dismissal
+        nothing confirmed. So does one that rendered fewer than ``min_cards``,
+        which the caller sets from what the same search showed before, since
+        a partly rendered rail may stop short of the job's card.
+        """
+        await self._open_job_search(url)
+        found = await self._locate_search_card(job_id)
+        if found["matches"]:
+            return True
+        if not found["cards"]:
+            raise LinkedInOperationError(
+                f"The job search at {url} rendered no result cards, so whether "
+                f"it still lists job {job_id} could not be read"
+            )
+        if found["cards"] < min_cards:
+            raise LinkedInOperationError(
+                f"The job search at {url} rendered {found['cards']} result cards "
+                f"where {min_cards} were expected, so whether it still lists job "
+                f"{job_id} could not be read"
+            )
+        return False
+
+    async def dismiss_search_card(
+        self, url: str, job_id: str
+    ) -> tuple[SearchCardOutcome, int]:
+        """Click the dismiss button on ``job_id``'s card in the search at ``url``.
+
+        Success is the card turning to its undo state; the caller confirms it
+        against a fresh load of the search, which should render as many cards
+        as this one, returned alongside the outcome, less the job's own.
+        """
+        await self._open_job_search(url)
+        found = await self._locate_search_card(job_id)
+        cards = found["cards"]
+        if not found["matches"]:
+            return "absent", cards
+        if found["dismiss"] != 1:
+            if found["matches"] == 1 and found["undo"] and not found["dismiss"]:
+                return "already_dismissed", cards
+            return "no_button", cards
+
+        page = self._session.page
+        await page.locator(f"button[{_DISMISS_MARK}]").click(timeout=5000)
+        deadline = self._session.monotonic() + _DISMISS_TIMEOUT
+        while self._session.monotonic() < deadline:
+            await self._session.delay(_SEARCH_POLL)
+            found = await self._find_search_card(job_id)
+            if found["undo"] and not found["dismiss"]:
+                return "dismissed", cards
+        return "not_dismissed", cards

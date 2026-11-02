@@ -6,7 +6,7 @@ import asyncio
 import atexit
 import codecs
 from collections import deque
-from collections.abc import AsyncIterator, Callable, Iterator, Mapping
+from collections.abc import AsyncGenerator, AsyncIterator, Callable, Generator, Mapping
 import contextlib
 import errno
 from contextvars import ContextVar
@@ -827,6 +827,58 @@ def get_bootstrap_state() -> BootstrapState:
     return _state
 
 
+def bootstrap_observation() -> dict[str, str | bool]:
+    from linkedin_mcp_server.core.exceptions import AccountRestrictedError
+
+    setup = _state.setup_state.value
+    login = _state.auth_state.value
+    restricted = _state.account_restricted
+    task = _state.setup_task
+    if task is not None and task.done():
+        if task.cancelled():
+            setup = "cancelled"
+        else:
+            setup = "failed" if task.exception() is not None else "ready"
+
+    task = _state.login_task
+    if task is not None and task.done():
+        if task.cancelled():
+            login = "cancelled"
+        else:
+            error = task.exception()
+            login = "failed" if error is not None else "auth_ready"
+            if error is not None:
+                restricted = isinstance(error, AccountRestrictedError)
+
+    imported = "not_started"
+    import_task = _state.import_task
+    if import_task is not None:
+        if not import_task.done():
+            imported = "in_progress"
+        elif import_task.cancelled():
+            imported = "cancelled"
+        elif (error := import_task.exception()) is not None:
+            imported = "failed"
+            restricted |= isinstance(error, AccountRestrictedError)
+        else:
+            imported = "succeeded" if import_task.result() else "no_session"
+
+    try:
+        quiescent = _auth_quiescent and not _auth_quiescence_lifted()
+    except UnicodeDecodeError:
+        quiescent = _auth_quiescent
+
+    # Observe completion without reconciling tasks or consuming pending errors.
+    # A replacement can lift quiescence before the next readiness call does so.
+    return {
+        "setup": setup,
+        "login": login,
+        "auto_import": imported,
+        "account_restricted": restricted,
+        "auth_quiescent": quiescent,
+    }
+
+
 async def _report_retained_browser_revisions_if_ready() -> None:
     try:
         ready = await _run_in_daemon_thread(_owned_browser_setup_ready)
@@ -1088,7 +1140,7 @@ class _SetupLifetimeExceeded(BrowserSetupFailedError):
 
 
 @contextlib.asynccontextmanager
-async def _setup_lifetime() -> AsyncIterator[None]:
+async def _setup_lifetime() -> AsyncGenerator[None]:
     """Bound one managed setup attempt, wherever that attempt is entered."""
     if _setup_lifetime_armed.get():
         yield
@@ -2701,7 +2753,7 @@ def _same_destination(one: object, other: object) -> bool:
 def _log_handlers_follow_the_live_region(
     before: tuple[object, object],
     destination: object,
-) -> Iterator[None]:
+) -> Generator[None]:
     """Let stream log handlers follow the streams rich redirects.
 
     rich swaps ``sys.stdout`` and ``sys.stderr`` for proxies while a live region
@@ -2848,7 +2900,7 @@ class _ConsoleThatGoesQuiet(Console):
 
 
 @contextlib.contextmanager
-def _cli_progress() -> Iterator[Callable[[str], None]]:
+def _cli_progress() -> Generator[Callable[[str], None]]:
     """A live progress bar for a terminal, plain lines for anything else.
 
     Patchright writes to a pipe here, so it picks its newline-delimited

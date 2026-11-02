@@ -12,6 +12,10 @@
       "get_page_text"
     ],
     "methods": {
+      "archive_conversation": {
+        "coroutine": true,
+        "signature": "(self, thread_id: 'str') -> 'dict[str, Any]'"
+      },
       "click_button_by_text": {
         "coroutine": true,
         "signature": "(self, text: 'str', *, scope: 'str' = 'main', timeout: 'int' = 5000) -> 'bool'"
@@ -19,6 +23,10 @@
       "connect_with_person": {
         "coroutine": true,
         "signature": "(self, username: 'str', *, note: 'str | None' = None) -> 'dict[str, Any]'"
+      },
+      "dismiss_job": {
+        "coroutine": true,
+        "signature": "(self, job_id: 'str') -> 'dict[str, Any]'"
       },
       "extract_feed": {
         "coroutine": true,
@@ -35,6 +43,10 @@
       "get_conversation": {
         "coroutine": true,
         "signature": "(self, linkedin_username: 'str | None' = None, thread_id: 'str | None' = None, index: 'int' = 0) -> 'dict[str, Any]'"
+      },
+      "get_easy_apply_form": {
+        "coroutine": true,
+        "signature": "(self, job_id: 'str') -> 'dict[str, Any]'"
       },
       "get_inbox": {
         "coroutine": true,
@@ -72,6 +84,10 @@
         "coroutine": true,
         "signature": "(self, username: 'str', requested: 'set[str]', callbacks: 'ProgressCallback | None' = None, max_scrolls: 'int | None' = None, *, main_profile_already_loaded: 'bool' = False, allow_self_alias: 'bool' = False) -> 'dict[str, Any]'"
       },
+      "reply_to_conversation": {
+        "coroutine": true,
+        "signature": "(self, thread_id: 'str', message: 'str', *, confirm_send: 'bool') -> 'dict[str, Any]'"
+      },
       "search_companies": {
         "coroutine": true,
         "signature": "(self, keywords: 'str') -> 'dict[str, Any]'"
@@ -90,7 +106,7 @@
       },
       "search_posts": {
         "coroutine": true,
-        "signature": "(self, keywords: 'str', date_posted: 'str | None' = None, max_pages: 'int' = 3) -> 'dict[str, Any]'"
+        "signature": "(self, keywords: 'str', date_posted: 'str | None' = None, max_pages: 'int' = 3, content_type: 'str | None' = None) -> 'dict[str, Any]'"
       },
       "send_message": {
         "coroutine": true,
@@ -98,11 +114,14 @@
       }
     },
     "tool_methods": [
+      "archive_conversation",
       "connect_with_person",
+      "dismiss_job",
       "extract_feed",
       "extract_page",
       "get_company_employees",
       "get_conversation",
+      "get_easy_apply_form",
       "get_inbox",
       "get_job_apply_url",
       "get_my_profile",
@@ -111,6 +130,7 @@
       "read_company",
       "read_job",
       "read_person",
+      "reply_to_conversation",
       "search_companies",
       "search_conversations",
       "search_jobs",
@@ -119,6 +139,25 @@
       "send_message"
     ],
     "tool_schemas": {
+      "archive_conversation": {
+        "input": {
+          "additionalProperties": false,
+          "properties": {
+            "thread_id": {
+              "description": "LinkedIn messaging thread ID, as get_inbox,\nsearch_conversations or get_conversation return it",
+              "type": "string"
+            }
+          },
+          "required": [
+            "thread_id"
+          ],
+          "type": "object"
+        },
+        "output": {
+          "additionalProperties": true,
+          "type": "object"
+        }
+      },
       "close_session": {
         "input": {
           "additionalProperties": false,
@@ -153,6 +192,25 @@
           },
           "required": [
             "linkedin_username"
+          ],
+          "type": "object"
+        },
+        "output": {
+          "additionalProperties": true,
+          "type": "object"
+        }
+      },
+      "dismiss_job": {
+        "input": {
+          "additionalProperties": false,
+          "properties": {
+            "job_id": {
+              "description": "LinkedIn job ID (e.g., \"4252026496\", \"3856789012\")",
+              "type": "string"
+            }
+          },
+          "required": [
+            "job_id"
           ],
           "type": "object"
         },
@@ -298,6 +356,25 @@
           "type": "object"
         }
       },
+      "get_easy_apply_form": {
+        "input": {
+          "additionalProperties": false,
+          "properties": {
+            "job_id": {
+              "description": "LinkedIn job ID (e.g., \"4252026496\", \"3856789012\")",
+              "type": "string"
+            }
+          },
+          "required": [
+            "job_id"
+          ],
+          "type": "object"
+        },
+        "output": {
+          "additionalProperties": true,
+          "type": "object"
+        }
+      },
       "get_feed": {
         "input": {
           "additionalProperties": false,
@@ -402,7 +479,7 @@
                 }
               ],
               "default": null,
-              "description": "Comma-separated list of extra sections to read.\nThe main profile page is always included.\nAvailable sections: experience, education, interests, honors, languages, certifications, skills, projects, contact_info, posts\nExamples: \"experience,education\", \"contact_info\", \"skills,projects\"\nDefault (None) reads only the main profile page."
+              "description": "Comma-separated list of extra sections to read.\nThe main profile page is always included.\nAvailable sections: experience, education, interests, honors, volunteering, languages, certifications, skills, projects, contact_info, posts\nExamples: \"experience,education\", \"contact_info\", \"skills,projects\"\nDefault (None) reads only the main profile page."
             }
           },
           "type": "object"
@@ -444,7 +521,7 @@
                 }
               ],
               "default": null,
-              "description": "Comma-separated list of extra sections to read.\nThe main profile page is always included.\nAvailable sections: experience, education, interests, honors, languages, certifications, skills, projects, contact_info, posts\nExamples: \"experience,education\", \"contact_info\", \"skills,projects\", \"honors,languages\", \"posts\"\nDefault (None) reads only the main profile page."
+              "description": "Comma-separated list of extra sections to read.\nThe main profile page is always included.\nAvailable sections: experience, education, interests, honors, volunteering, languages, certifications, skills, projects, contact_info, posts\nExamples: \"experience,education\", \"contact_info\", \"skills,projects\", \"honors,languages\", \"posts\"\nDefault (None) reads only the main profile page."
             }
           },
           "required": [
@@ -487,6 +564,17 @@
           "type": "object"
         }
       },
+      "get_session_status": {
+        "input": {
+          "additionalProperties": false,
+          "properties": {},
+          "type": "object"
+        },
+        "output": {
+          "additionalProperties": true,
+          "type": "object"
+        }
+      },
       "get_sidebar_profiles": {
         "input": {
           "additionalProperties": false,
@@ -498,6 +586,35 @@
           },
           "required": [
             "linkedin_username"
+          ],
+          "type": "object"
+        },
+        "output": {
+          "additionalProperties": true,
+          "type": "object"
+        }
+      },
+      "reply_to_conversation": {
+        "input": {
+          "additionalProperties": false,
+          "properties": {
+            "confirm_send": {
+              "description": "Must be True to send. False is a dry run that verifies\nthe thread and composer, types nothing, and says who the reply\nwould go to.",
+              "type": "boolean"
+            },
+            "message": {
+              "description": "Message text, read as send_message reads it: LF, CRLF and\nCR all end a line, empty lines are kept, and the whole message\nis trimmed. Tab, other control characters, DEL, U+0085, U+2028\nand U+2029 are refused.",
+              "type": "string"
+            },
+            "thread_id": {
+              "description": "LinkedIn messaging thread ID, or a /messaging/thread/<id>/\nreference as another tool returned it",
+              "type": "string"
+            }
+          },
+          "required": [
+            "thread_id",
+            "message",
+            "confirm_send"
           ],
           "type": "object"
         },
@@ -684,7 +801,7 @@
                 }
               ],
               "default": null,
-              "description": "Optional location filter (e.g., \"New York\", \"Remote\")"
+              "description": "Optional location filter, as LinkedIn's numeric geo URN\nid (e.g., \"103644278\" for the United States). Plain-text place\nnames are silently ignored by LinkedIn and return unfiltered\nresults, so they are refused here. The id is the geoUrn value\nin the URL of a LinkedIn people search filtered to that place;\nwithout one, put the place in keywords instead."
             },
             "network": {
               "anyOf": [
@@ -716,6 +833,18 @@
         "input": {
           "additionalProperties": false,
           "properties": {
+            "content_type": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "Optional \"Content type\" filter. One of\n\"documents\" (PDFs and slide decks people upload), \"images\",\n\"videos\", \"live_videos\", \"job_posts\". Omit for all posts."
+            },
             "date_posted": {
               "anyOf": [
                 {

@@ -6,23 +6,26 @@ A Model Context Protocol (MCP) server that connects AI assistants to LinkedIn. A
 
 ## Features
 
-- **Profile Access**: Get detailed LinkedIn profile information including experience, education, skills, projects, certifications, and more
+- **Profile Access**: Get detailed LinkedIn profile information including experience, education, skills, projects, certifications, volunteering, and more
 - **Own Profile**: Fetch the authenticated user's own profile to give agents self-context
 - **Profile Connections**: Send connection requests or accept incoming ones, with optional notes
 - **Sidebar Profiles**: Extract profile URLs from the sidebar recommendation sections on a profile page ("More profiles for you", "Explore premium profiles", "People you may know")
-- **Messaging**: List the inbox, read a conversation by username or thread ID, search messages by keyword, and compose/send a new message with explicit confirmation (profile-based send may open a separate DM rather than reply in an existing thread)
+- **Messaging**: List the inbox, read a conversation by username or thread ID, search messages by keyword, archive a conversation by thread ID, and compose/send a new message or reply inside an existing thread by thread ID, InMail included, both with explicit confirmation (profile-based send may open a separate DM, so replies go through the thread)
 - **Company Profiles**: Extract comprehensive company data, including the LinkedIn company URN id (used by LinkedIn's people-search `currentCompany` URL facet)
 - **Company Employees**: List employees at a company with optional keyword filtering
 - **Company Search**: Search for companies by keyword
 - **Job Details**: Retrieve job posting information
+- **Easy Apply Forms**: Read the questions of a job's Easy Apply form, with each field's type, options and prefilled value, without typing or submitting
 - **Job Search**: Search for jobs with keywords and location filters
 - **Saved Jobs**: List job postings saved by the authenticated user
+- **Dismiss Jobs**: Dismiss a job from job search so later searches no longer show it
 - **People Search**: Search for people by keywords and location
 - **Person Posts**: Get recent activity/posts from a person's profile
 - **Company Posts**: Get recent posts from a company's LinkedIn feed
 - **Home Feed**: Get recent posts from the authenticated user's LinkedIn home feed
-- **Post Search**: Search posts/content globally by keyword (the "Posts" tab) with an optional recency filter
+- **Post Search**: Search posts/content globally by keyword (the "Posts" tab) with optional recency and content-type filters, such as uploaded documents
 - **Compact References**: Return typed per-section links alongside readable text without shipping full-page markdown
+- **Session Status**: Diagnose saved-session files and the serving process's browser state without opening a browser or contacting LinkedIn
 
 ## Quick Start
 
@@ -52,7 +55,7 @@ docker run -it --rm `
   --login --login-viewer
 ```
 
-Open the full URL the command prints (it carries the access token) and sign in. The viewer closes itself afterwards; let the command exit on its own so the session is stored completely. It gives up after 30 minutes.
+Open the full URL the command prints (it carries the access token) and sign in. Ctrl+V (Cmd+V on a Mac) pastes plain ASCII text, such as a password from your password manager, into the login browser. The viewer closes itself afterwards; let the command exit on its own so the session is stored completely. It gives up after 30 minutes.
 
 Keep the same host directory mounted at `/home/pwuser/.linkedin-mcp` on every later `docker run`. A session created on the host with `uvx mcp-server-linkedin@latest --login` works too, and the container then rebuilds its own profile from those cookies on each start.
 
