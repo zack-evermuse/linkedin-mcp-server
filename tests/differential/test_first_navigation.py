@@ -18,13 +18,16 @@ import ctypes
 import errno
 import hashlib
 import json
+import math
 import os
+import select
+import signal
 import socket
 import subprocess
 import sys
 import threading
 import time
-from collections.abc import AsyncGenerator, Callable
+from collections.abc import AsyncGenerator, Callable, Generator
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -186,6 +189,83 @@ async def _until(condition: Callable[[], Any], seconds: float, what: str) -> Any
     pytest.fail(f"{what} within {seconds}s")
 
 
+#: Whole reads of the process tree a sampler wait allows. One shows what was
+#: there when it began; the rest cover a process read that failed and is
+#: asked again on the next one.
+SAMPLER_READS = 3
+
+#: How long a sampler wait tolerates a sampler that makes no read at all.
+#: Measured under ``-n 4`` with every browser case running: one read took at
+#: most 8 ms and reads began at most 123 ms apart. A stall this long is the
+#: host's, and the failure says so instead of blaming the sampler.
+SAMPLER_STALL_SECONDS = 60.0
+
+
+async def _sampled(
+    sampler: LifetimeSampler,
+    condition: Callable[[dict[str, Any]], Any],
+    what: str,
+) -> Any:
+    """*condition* of the sampler's document, bounded by the sampler's reads.
+
+    For a process that exists before the wait begins. The wait fails once
+    ``SAMPLER_READS`` whole reads, each begun after the wait, have not shown
+    *condition*. A host that holds the sampler only delays the answer: a
+    clock bound read such a stall as a running browser left unidentified.
+    """
+    document = sampler.document
+    # The read under way may have listed the tree before this wait began, so
+    # the reads that count start with the one after it. Read k is whole once
+    # read k + 1 has begun.
+    enough = document["samples"] + 2 + SAMPLER_READS
+    seen, moved = document["samples"], time.monotonic()
+    while True:
+        # Counted before the condition is read, so a read that ends between
+        # the two cannot fail a wait it has just satisfied.
+        samples = document["samples"]
+        value = condition(document)
+        if value:
+            return value
+        if document["sampler"] != "running":
+            pytest.fail(f"{what}: the sampler is {document['sampler']}")
+        if samples >= enough:
+            pytest.fail(f"{what} in {SAMPLER_READS} reads of the process tree")
+        if samples != seen:
+            seen, moved = samples, time.monotonic()
+        elif time.monotonic() - moved > SAMPLER_STALL_SECONDS:
+            pytest.fail(
+                f"{what}: the sampler made no read for {SAMPLER_STALL_SECONDS:g}s"
+            )
+        await asyncio.sleep(0.05)
+
+
+def _started_samplers(monkeypatch: pytest.MonkeyPatch) -> list[LifetimeSampler]:
+    """Every sampler started from here on, ``observing``'s own included."""
+    started: list[LifetimeSampler] = []
+    start = LifetimeSampler.start
+
+    def recorded(self: LifetimeSampler) -> LifetimeSampler:
+        started.append(self)
+        return start(self)
+
+    monkeypatch.setattr(LifetimeSampler, "start", recorded)
+    return started
+
+
+def _dead(process: psutil.Process) -> bool:
+    """Whether *process* has ended: a zombie on POSIX, gone on Windows."""
+    try:
+        return process.status() == psutil.STATUS_ZOMBIE
+    except psutil.NoSuchProcess:
+        return True
+
+
+def _roots(document: dict[str, Any]) -> list[dict[str, Any]]:
+    """The browser roots a lifetimes document holds, in identification order."""
+    found = [p for p in document.get("processes", []) if p["role"] == "browser-root"]
+    return sorted(found, key=lambda p: p["identified_ms"])
+
+
 # --- Which phase a stalled first navigation reached ----------------------------
 
 
@@ -216,6 +296,95 @@ async def test_a_black_hole_origin_is_a_navigation_stalled_before_its_response(
     assert record["stalled_phase"] == "response"
 
 
+#: A bound on waiting for a real browser to reach a phase, so one that never
+#: gets there fails instead of hanging. The tests assert the phase, not this.
+_PHASE_SECONDS = 60.0
+
+
+async def _cut_off_once(
+    page: Any, url: str, *reached: tuple[str, Callable[[Any], bool]]
+) -> None:
+    """Navigate *page* to *url* untimed, and cancel it once all of *reached* fired.
+
+    Each of *reached* is a page event and a test of its argument. A goto given
+    a deadline instead records whatever phase the host had got to by then: a
+    pause before the response spent a five second timeout before the commit,
+    and the record then showed a stall where none was. The goto still running
+    once the phases have arrived is what shows it stalled.
+    """
+    signals: list[asyncio.Event] = []
+    for event, test in reached:
+        happened = asyncio.Event()
+        signals.append(happened)
+
+        def fire(value: Any, test=test, happened=happened) -> None:
+            if test(value):
+                happened.set()
+
+        page.on(event, fire)
+    navigation = asyncio.ensure_future(
+        page.goto(url, wait_until="domcontentloaded", timeout=0)
+    )
+    try:
+        for happened in signals:
+            await asyncio.wait_for(happened.wait(), _PHASE_SECONDS)
+        assert not navigation.done(), "the navigation ended instead of stalling"
+    finally:
+        navigation.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await navigation
+
+
+#: The main frame's commit, which the recorder takes from the same event.
+_COMMITTED = ("framenavigated", lambda frame: frame.parent_frame is None)
+
+
+class _Target:
+    """A page or context that takes listeners and never fires them."""
+
+    def __init__(self, context: _Target | None = None) -> None:
+        self.context = context
+        self.pages: list[Any] = []
+
+    def on(self, event: str, handler: Callable[..., None]) -> None:
+        return None
+
+    def remove_listener(self, event: str, handler: Callable[..., None]) -> None:
+        return None
+
+
+async def test_a_goto_that_runs_out_its_timeout_is_recorded_as_one(tmp_path):
+    """How a timed out goto is recorded, apart from which phase it reached.
+
+    Patchright's own call is stood in by one that raises its TimeoutError, so
+    the record does not depend on how far a real browser got first. The phase
+    cases below cancel their goto instead, once the phase is reached.
+    """
+    path = tmp_path / FIRST_NAVIGATION_FILE
+
+    async def times_out(page: Any, url: str, **options: Any) -> None:
+        raise PlaywrightTimeoutError("Timeout 5000ms exceeded.")
+
+    page = _Target(context=_Target())
+    goto = first_navigation._wrap_goto(times_out)
+    with observe_navigation(path, label="timeout"):
+        with pytest.raises(PlaywrightTimeoutError):
+            await goto(
+                page,
+                "http://127.0.0.1:9/headers",
+                wait_until="domcontentloaded",
+                timeout=5_000,
+            )
+    record = _record(path)
+    (navigation,) = record["navigations"]
+    assert navigation["outcome"] == "TimeoutError"
+    assert navigation["timeout_ms"] == 5_000
+    assert navigation["ended_ms"] is not None
+    assert record["first_failed_navigation"] == 0
+    # Nothing was observed before it gave up, so the first phase is the stall.
+    assert record["stalled_phase"] == "request"
+
+
 @_browser_case
 async def test_headers_and_a_commit_then_a_stalled_document_stall_before_domcontentloaded(
     tmp_path,
@@ -224,16 +393,13 @@ async def test_headers_and_a_commit_then_a_stalled_document_stall_before_domcont
     with _Origin() as origin:
         with observe_navigation(path, label="headers"):
             async with _browser(tmp_path / "profile") as context:
-                with pytest.raises(PlaywrightTimeoutError):
-                    await context.pages[0].goto(
-                        origin.url("/headers"),
-                        wait_until="domcontentloaded",
-                        timeout=5_000,
-                    )
+                await _cut_off_once(
+                    context.pages[0], origin.url("/headers"), _COMMITTED
+                )
     record = _record(path)
     (navigation,) = record["navigations"]
     phases = navigation["phases"]
-    assert navigation["outcome"] == "TimeoutError"
+    assert navigation["outcome"] == "CancelledError"
     assert navigation["response_status"] == 200
     assert phases["request"] is not None
     assert phases["response"] is not None
@@ -256,12 +422,26 @@ async def test_a_parser_blocking_script_leaves_domcontentloaded_missing(tmp_path
         with _Origin() as origin:
             with observe_navigation(path, label="blocking"):
                 async with _browser(profile) as context:
-                    with pytest.raises(PlaywrightTimeoutError):
-                        await context.pages[0].goto(
-                            origin.url("/blocking"),
-                            wait_until="domcontentloaded",
-                            timeout=5_000,
-                        )
+                    await _cut_off_once(
+                        context.pages[0],
+                        origin.url("/blocking"),
+                        _COMMITTED,
+                        (
+                            "request",
+                            lambda request: request.url.endswith("/stalled.js"),
+                        ),
+                    )
+                    # The cut-off navigation is quick, so the browser could close
+                    # before the sampler ever saw it; the lifetimes asserted below
+                    # need both processes identified while they still run.
+                    await _sampled(
+                        lifetimes,
+                        lambda document: (
+                            {p["role"] for p in document.get("processes", [])}
+                            >= {"browser-root", "driver"}
+                        ),
+                        "the browser root and driver were not identified",
+                    )
     finally:
         lifetimes.stop(exc=None, requested=requested_ends(path))
     record = _record(path)
@@ -298,20 +478,8 @@ async def test_a_browser_killed_under_a_living_driver_is_an_unexpected_end(tmp_p
             with observe_navigation(path, label="killed") as recorder:
                 async with _browser(profile) as context:
                     page = context.pages[0]
-
-                    def root() -> dict[str, Any] | None:
-                        document = read_document(lifetimes_path) or {}
-                        return next(
-                            (
-                                p
-                                for p in document.get("processes", [])
-                                if p["role"] == "browser-root"
-                            ),
-                            None,
-                        )
-
-                    found = await _until(
-                        root, 15, "the browser root was not identified"
+                    (found,) = await _sampled(
+                        lifetimes, _roots, "the browser root was not identified"
                     )
                     process = psutil.Process(found["pid"])
                     assert process.create_time() == pytest.approx(
@@ -351,35 +519,34 @@ async def test_a_browser_killed_under_a_living_driver_is_an_unexpected_end(tmp_p
 
 
 @_browser_case
-async def test_a_relaunch_keeps_the_first_launch_and_reads_its_own_ends(tmp_path):
+async def test_a_relaunch_keeps_the_first_launch_and_reads_its_own_ends(
+    tmp_path, monkeypatch
+):
     """Staging's relaunch after a stall: two browsers on one profile, observed
     by the harness's own ``observing``. The first launch keeps the top level
     and its stalled navigation; the second is appended, and its browser lost
     before its own close reads as unexpected, not as ended by the first's."""
     evidence = tmp_path / "evidence"
     profile = tmp_path / "profile"
-
-    def roots() -> list[dict[str, Any]]:
-        document = read_document(evidence / BROWSER_LIFETIMES_FILE) or {}
-        found = [
-            p for p in document.get("processes", []) if p["role"] == "browser-root"
-        ]
-        return sorted(found, key=lambda p: p["identified_ms"])
+    started = _started_samplers(monkeypatch)
 
     with _Origin() as origin:
         with observing(evidence, profile=profile, label="relaunch") as path:
+            (sampler,) = started
             async with _browser(profile) as context:
                 with pytest.raises(PlaywrightTimeoutError):
                     await context.pages[0].goto(
                         origin.url("/black-hole"), timeout=1_000
                     )
-                await _until(roots, 15, "the first browser root was not identified")
+                await _sampled(
+                    sampler, _roots, "the first browser root was not identified"
+                )
             async with _browser(profile) as context:
                 page = context.pages[0]
                 await page.goto(origin.url("/"))
-                second = await _until(
-                    lambda: len(roots()) == 2 and roots()[1],
-                    15,
+                second = await _sampled(
+                    sampler,
+                    lambda document: len(_roots(document)) == 2 and _roots(document)[1],
                     "the second browser root was not identified",
                 )
                 root = psutil.Process(second["pid"])
@@ -390,9 +557,11 @@ async def test_a_relaunch_keeps_the_first_launch_and_reads_its_own_ends(tmp_path
                 reaper.suspend()
                 try:
                     root.kill()
-                    await _until(
-                        lambda: roots()[1]["gone_ms"] is not None,
-                        15,
+                    # The kernel's part first: the reads count from a dead root.
+                    await _until(lambda: _dead(root), 15, "the killed root did not end")
+                    await _sampled(
+                        sampler,
+                        lambda document: _roots(document)[1]["gone_ms"] is not None,
                         "the second browser root was not seen gone",
                     )
                 finally:
@@ -407,16 +576,178 @@ async def test_a_relaunch_keeps_the_first_launch_and_reads_its_own_ends(tmp_path
     assert record["close_requested_ms"] < relaunch["launch"]["started_ms"]
     assert relaunch["close_requested_ms"] > relaunch["launch"]["started_ms"]
     assert record["driver"]["pid"] != relaunch["driver"]["pid"]
-    first, second = (root["ended"] for root in roots())
+    first, second = (
+        root["ended"] for root in _roots(_record(evidence / BROWSER_LIFETIMES_FILE))
+    )
     assert first in ("after-close-request", "ambiguous")
     assert second == "unexpected"
+
+
+def _like_a_root(arguments: list[str]) -> bool:
+    return any(a.startswith("--user-data-dir=") for a in arguments) and not any(
+        a.startswith("--type=") for a in arguments
+    )
+
+
+@contextlib.contextmanager
+def _forks_of(root: int) -> Generator[Callable[[], object]]:
+    """A wait that returns once *root* forks, or after 10 ms; on a host
+    without kqueue, at once."""
+    if sys.platform != "darwin":
+        yield lambda: None
+        return
+    queue = select.kqueue()
+    try:
+        queue.control(
+            [
+                select.kevent(
+                    root, select.KQ_FILTER_PROC, select.KQ_EV_ADD, select.KQ_NOTE_FORK
+                )
+            ],
+            0,
+        )
+        yield lambda: queue.control(None, 1, 0.01)
+    finally:
+        queue.close()
+
+
+class _ForkHolder:
+    """Stops every process a browser root forks while it still carries the
+    root's command line, and resumes it once the sampler has read the tree
+    ``SAMPLER_READS`` whole times since. ``roots`` is every root it
+    watched, in launch order."""
+
+    def __init__(self, sampler: LifetimeSampler) -> None:
+        self._sampler = sampler
+        self._me = first_navigation._this_process(psutil)
+        self._done = threading.Event()
+        self.roots: list[int] = []
+        self.held: list[int] = []
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._switch = sys.getswitchinterval()
+
+    def __enter__(self) -> _ForkHolder:
+        sys.setswitchinterval(1e-5)
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self._done.set()
+        self._thread.join()
+        sys.setswitchinterval(self._switch)
+
+    def _run(self) -> None:
+        while not self._done.is_set():
+            root = self._find_root()
+            if root is None:
+                continue
+            self.roots.append(root)
+            with contextlib.suppress(psutil.Error, OSError):
+                self._watch(psutil.Process(root))
+
+    def _find_root(self) -> int | None:
+        try:
+            children = self._me.children(recursive=True)
+        except (psutil.Error, OSError):
+            return None
+        for child in children:
+            if child.pid in self.roots:
+                continue
+            with contextlib.suppress(psutil.Error):
+                if _like_a_root(child.cmdline()):
+                    return child.pid
+        return None
+
+    def _watch(self, root: psutil.Process) -> None:
+        seen: set[int] = set()
+        with _forks_of(root.pid) as wait:
+            while not self._done.is_set() and not _dead(root):
+                wait()
+                fresh = [p for p in self._children_of(root.pid) if p not in seen]
+                for pid in fresh:
+                    seen.add(pid)
+                    self._hold_if_forked(pid)
+
+    def _children_of(self, pid: int) -> list[int]:
+        if isinstance(self._me, first_navigation._MacDescendants):
+            return self._me._child_pids(pid)
+        return [child.pid for child in psutil.Process(pid).children()]
+
+    def _hold_if_forked(self, pid: int) -> None:
+        try:
+            os.kill(pid, signal.SIGSTOP)
+        except OSError:
+            return
+        try:
+            if self._carries_a_root_line(pid):
+                self.held.append(pid)
+                self._hold()
+        finally:
+            with contextlib.suppress(OSError):
+                os.kill(pid, signal.SIGCONT)
+
+    def _carries_a_root_line(self, pid: int) -> bool:
+        try:
+            return _like_a_root(psutil.Process(pid).cmdline())
+        except psutil.Error:
+            return False
+
+    def _hold(self) -> None:
+        document = self._sampler.document
+        enough = document["samples"] + 1 + SAMPLER_READS
+        while (
+            document["samples"] < enough
+            and document["sampler"] == "running"
+            and not self._done.is_set()
+        ):
+            time.sleep(0.01)
+
+
+_FORK_LAUNCHES = 5
+
+
+@_browser_case
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX stop signals")
+async def test_a_fork_of_the_root_is_not_a_second_root(tmp_path, monkeypatch):
+    """Chromium forks its root to start the crash handler, and the fork keeps
+    the root's command line until it executes. Held there for whole reads of
+    the process tree, it is still not a browser root, and its end is not an
+    unexpected one."""
+    evidence = tmp_path / "evidence"
+    profile = tmp_path / "profile"
+    started = _started_samplers(monkeypatch)
+    with observing(evidence, profile=profile, label="fork"):
+        (sampler,) = started
+        with _ForkHolder(sampler) as holder:
+            for _ in range(_FORK_LAUNCHES):
+                async with _browser(profile) as context:
+                    await context.pages[0].goto("about:blank")
+                    goal = sampler.document["samples"] + 1 + SAMPLER_READS
+                    await _sampled(
+                        sampler,
+                        lambda document: document["samples"] >= goal,
+                        "the sampler did not read the tree",
+                    )
+                if holder.held:
+                    break
+    if not holder.held:
+        pytest.skip("this Chromium forked no process with its root's command line")
+    document = _record(evidence / BROWSER_LIFETIMES_FILE)
+    assert [root["pid"] for root in _roots(document)] == holder.roots
+    assert not [p for p in document["processes"] if p["pid"] in holder.held]
+    assert "unexpected" not in [p["ended"] for p in document["processes"]]
 
 
 # --- Observers that leave ---------------------------------------------------------
 
 
 @_browser_case
-async def test_observers_detach_and_the_sampler_stops_within_its_bound(tmp_path):
+async def test_observers_detach_and_the_sampler_stops(tmp_path):
+    """Whether the stop kept to its bound is the slow process table case's.
+
+    Here the stop's own report is diagnostics: a host that stalls the closing
+    sample makes ``stopped_within_bound`` false while nothing stayed attached.
+    """
     evidence = tmp_path / "evidence"
     profile = tmp_path / "profile"
     path = evidence / FIRST_NAVIGATION_FILE
@@ -446,11 +777,11 @@ async def test_observers_detach_and_the_sampler_stops_within_its_bound(tmp_path)
     assert record["observer"]["detach_failures"] == 0
     assert record["observer"]["errors"] == 0
     sampled = _record(evidence / BROWSER_LIFETIMES_FILE)
-    assert sampled["stopped_within_bound"] is True
-    assert sampled["stop_seconds"] <= STOP_SECONDS
-    assert not any(
-        thread.name == f"lifetimes-{label}" for thread in threading.enumerate()
-    )
+    assert isinstance(sampled["stopped_within_bound"], bool), "the stop never ended"
+    samplers = [t for t in threading.enumerate() if t.name == f"lifetimes-{label}"]
+    for sampler in samplers:
+        sampler.join(SAMPLER_STALL_SECONDS)
+    assert not any(sampler.is_alive() for sampler in samplers)
 
 
 # --- A staging process that never finished ----------------------------------------
@@ -512,18 +843,29 @@ async def test_a_killed_staging_process_leaves_what_it_had_observed(tmp_path):
             deadline = time.monotonic() + 30
             while not requested():
                 if child.poll() is not None:
-                    pytest.skip(f"the staging process ended first: {child.stderr}")
+                    # A surviving driver can hold stderr open past the
+                    # child's exit, so the read is bounded.
+                    try:
+                        _, stderr = child.communicate(timeout=5)
+                    except subprocess.TimeoutExpired as exc:
+                        stderr = exc.stderr or b""
+                    pytest.skip(
+                        f"the staging process ended first: {stderr.decode(errors='replace')}"
+                    )
                 if time.monotonic() > deadline:
                     pytest.fail("the staging process never sent its request")
                 await asyncio.sleep(0.05)
         finally:
-            tree = [psutil.Process(child.pid)]
-            with contextlib.suppress(psutil.Error):
-                tree += tree[0].children(recursive=True)
-            for process in tree:
+            # poll() reaps a child that has ended, which frees its pid for
+            # reuse: only a child not yet reaped is walked and killed.
+            if child.poll() is None:
+                tree = [psutil.Process(child.pid)]
                 with contextlib.suppress(psutil.Error):
-                    process.kill()
-            psutil.wait_procs(tree, timeout=10)
+                    tree += tree[0].children(recursive=True)
+                for process in tree:
+                    with contextlib.suppress(psutil.Error):
+                        process.kill()
+                psutil.wait_procs(tree, timeout=10)
             child.wait(10)
     record = _record(path)
     assert record["label"] == "killed-staging"
@@ -862,18 +1204,133 @@ class _SlowChild:
         return ["not-chromium"]
 
 
+class _ReadClock:
+    """A monotonic clock that only process reads move, and a join that keeps to it.
+
+    The sampler's deadlines and the stop's bound are read from it, so which
+    reads fit inside a bound follows from how long each read says it took,
+    never from how long the host took to run it. A read that would carry the
+    clock past a waiting join's timeout stops the clock there and stays under
+    way until :meth:`release`, as a read still running when a real join gives
+    up does.
+    """
+
+    def __init__(self) -> None:
+        self._now = 0.0
+        self._until = math.inf
+        self._overran = False
+        self._released = threading.Event()
+        self._moved = threading.Condition()
+
+    def monotonic(self) -> float:
+        with self._moved:
+            return self._now
+
+    def advance(self, seconds: float) -> None:
+        with self._moved:
+            if self._now + seconds <= self._until:
+                self._now += seconds
+                return
+            self._now = self._until
+            self._overran = True
+            self._moved.notify_all()
+        self._released.wait(SAMPLER_STALL_SECONDS)
+
+    def join(self, thread: threading.Thread, timeout: float) -> None:
+        """``thread.join(timeout)``, with *timeout* counted on this clock."""
+        stalled_after = time.monotonic() + SAMPLER_STALL_SECONDS
+        with self._moved:
+            self._until = self._now + timeout
+            while thread.is_alive() and not self._overran:
+                assert time.monotonic() < stalled_after, "the sampler made no progress"
+                self._moved.wait(0.01)
+            self._until = math.inf
+
+    def release(self) -> None:
+        """Let a read the join gave up on finish."""
+        self._released.set()
+
+
+class _ChildReadOnTheClock:
+    """A descendant whose every read takes *delay* on *clock*.
+
+    Each read sets *reading* and then waits for *stopping*, so a stop that
+    waits for *reading* lands in the middle of a slow sample.
+    """
+
+    def __init__(
+        self,
+        pid: int,
+        clock: _ReadClock,
+        delay: float,
+        *,
+        reading: threading.Event,
+        stopping: threading.Event,
+    ) -> None:
+        self.pid = pid
+        self._clock = clock
+        self._delay = delay
+        self._reading = reading
+        self._stopping = stopping
+
+    def create_time(self) -> float:
+        self._reading.set()
+        assert self._stopping.wait(SAMPLER_STALL_SECONDS), "the stop never began"
+        self._clock.advance(self._delay)
+        return 1.0
+
+    def status(self) -> str:
+        return psutil.STATUS_RUNNING
+
+    def cmdline(self) -> list[str]:
+        return ["not-chromium"]
+
+
 def test_a_slow_process_table_cannot_hold_the_stop_past_its_bound(
     tmp_path, monkeypatch
 ):
-    # One full sample here takes six seconds, three times the stop bound.
-    slow = [_SlowChild(pid, 0.3) for pid in range(100_000, 100_020)]
-    _list_descendants(monkeypatch, slow)
+    # One full sample here takes six seconds, three times the stop bound. The
+    # closing sample gives way at half the bound, so the sampler ends inside it.
+    clock = _ReadClock()
     label = f"slow-{os.getpid()}"
-    lifetimes = LifetimeSampler(
-        tmp_path / BROWSER_LIFETIMES_FILE, profile=tmp_path / "profile", label=label
-    ).start()
-    time.sleep(0.5)
-    lifetimes.stop(exc=None, requested=None)
+    with monkeypatch.context() as patched:
+        patched.setattr(
+            first_navigation,
+            "time",
+            SimpleNamespace(
+                monotonic=clock.monotonic,
+                monotonic_ns=time.monotonic_ns,
+                time=time.time,
+                sleep=time.sleep,
+            ),
+        )
+        lifetimes = LifetimeSampler(
+            tmp_path / BROWSER_LIFETIMES_FILE, profile=tmp_path / "profile", label=label
+        )
+        reading = threading.Event()
+        slow = [
+            _ChildReadOnTheClock(
+                pid, clock, 0.3, reading=reading, stopping=lifetimes._halt
+            )
+            for pid in range(100_000, 100_020)
+        ]
+        _list_descendants(patched, slow)
+        thread = lifetimes._thread
+        patched.setattr(
+            lifetimes,
+            "_thread",
+            SimpleNamespace(
+                start=thread.start,
+                is_alive=thread.is_alive,
+                join=lambda timeout: clock.join(thread, timeout),
+            ),
+        )
+        lifetimes.start()
+        assert reading.wait(SAMPLER_STALL_SECONDS), "the sampler never read a child"
+        try:
+            lifetimes.stop(exc=None, requested=None)
+        finally:
+            clock.release()
     sampled = _record(tmp_path / BROWSER_LIFETIMES_FILE)
     assert sampled["stopped_within_bound"] is True
     assert sampled["stop_seconds"] <= STOP_SECONDS

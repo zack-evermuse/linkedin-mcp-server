@@ -26,7 +26,7 @@ _RELEASE_WORKFLOW = _REPO_ROOT / ".github" / "workflows" / "release.yml"
 _EVIDENCE_WORKFLOW = _REPO_ROOT / ".github" / "workflows" / "differential-evidence.yml"
 _FORWARDER_WORKFLOW = _REPO_ROOT / ".github" / "workflows" / "forwarder-compat.yml"
 _DEPENDENCY_REVIEW = (
-    "actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0"
+    "actions/dependency-review-action@bbc44d14a204704ccc493733616cd1e93a0321ec # v5.0.1"
 )
 _ACTION_PIN = re.compile(r"uses:\s+[^@\s]+@([0-9a-f]{40})\s+#\s+v\S+")
 
@@ -124,7 +124,8 @@ def test_dependency_audit_is_scheduled_manual_and_informational() -> None:
     assert "push" not in triggers
     assert audit["strategy"]["fail-fast"] is False
     assert audit["strategy"]["matrix"]["scope"] == ["runtime", "full"]
-    assert audit["steps"][1]["with"]["version"] == "0.13.6"
+    # An exact release, so a new uv cannot change the audit output on its own.
+    assert re.fullmatch(r"\d+\.\d+\.\d+", audit["steps"][1]["with"]["version"])
     assert audit["steps"][1]["with"]["enable-cache"] is False
     assert "scripts/run_uv_audit.py" in audit["steps"][2]["run"]
     assert audit["steps"][3]["if"] == "always()"

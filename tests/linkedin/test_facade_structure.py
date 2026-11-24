@@ -27,12 +27,16 @@ FACADE_PACKAGE_IMPORTERS = {
     Path("tests/linkedin/test_facade_results.py"),
     Path("tests/linkedin/test_facade_structure.py"),
     Path("tests/test_dependencies.py"),
+    Path("tests/test_tools.py"),
 }
 
 PUBLIC_SIGNATURES = {
     "click_button_by_text": "(self, text: 'str', *, scope: 'str' = 'main', timeout: 'int' = 5000) -> 'bool'",
     "connect_with_person": "(self, username: 'str', *, note: 'str | None' = None) -> 'dict[str, Any]'",
-    "extract_feed": "(self, num_posts: 'int' = 10) -> 'ExtractedSection'",
+    "extract_feed": (
+        "(self, num_posts: 'int' = 10, max_scrolls: 'int | None' = None)"
+        " -> 'ExtractedSection'"
+    ),
     "extract_page": "(self, url: 'str', section_name: 'str', max_scrolls: 'int | None' = None) -> 'ExtractedSection'",
     "get_company_employees": "(self, company_name: 'str', keywords: 'str | None' = None) -> 'dict[str, Any]'",
     "get_conversation": "(self, linkedin_username: 'str | None' = None, thread_id: 'str | None' = None, index: 'int' = 0) -> 'dict[str, Any]'",
@@ -50,8 +54,8 @@ PUBLIC_SIGNATURES = {
     "search_companies": "(self, keywords: 'str') -> 'dict[str, Any]'",
     "search_conversations": "(self, keywords: 'str', limit: 'int' = 20) -> 'dict[str, Any]'",
     "archive_conversation": "(self, thread_id: 'str') -> 'dict[str, Any]'",
-    "search_jobs": "(self, keywords: 'str', location: 'str | None' = None, max_pages: 'int' = 3, date_posted: 'str | None' = None, job_type: 'str | None' = None, experience_level: 'str | None' = None, work_type: 'str | None' = None, easy_apply: 'bool' = False, sort_by: 'str | None' = None, tool_timeout: 'float' = 180.0) -> 'dict[str, Any]'",
-    "search_people": "(self, keywords: 'str', location: 'str | None' = None, network: 'list[str] | None' = None, current_company: 'str | None' = None) -> 'dict[str, Any]'",
+    "search_jobs": "(self, keywords: 'str', location: 'str | None' = None, max_pages: 'int' = 3, date_posted: 'str | None' = None, job_type: 'str | None' = None, experience_level: 'str | None' = None, work_type: 'str | None' = None, easy_apply: 'bool' = False, sort_by: 'str | None' = None, tool_timeout: 'float' = 180.0, start: 'int' = 0) -> 'dict[str, Any]'",
+    "search_people": "(self, keywords: 'str', location: 'str | None' = None, network: 'list[str] | None' = None, current_company: 'str | None' = None, connection_of: 'str | None' = None) -> 'dict[str, Any]'",
     "search_posts": "(self, keywords: 'str', date_posted: 'str | None' = None, max_pages: 'int' = 3, content_type: 'str | None' = None) -> 'dict[str, Any]'",
     "send_message": "(self, linkedin_username: 'str', message: 'str', *, confirm_send: 'bool', profile_urn: 'str | None' = None) -> 'dict[str, Any]'",
     "reply_to_conversation": "(self, thread_id: 'str', message: 'str', *, confirm_send: 'bool') -> 'dict[str, Any]'",
@@ -88,7 +92,7 @@ DELEGATES = {
 DELEGATE_CALLS = {
     "click_button_by_text": "self._content.click_button_by_text(text, scope=scope, timeout=timeout)",
     "connect_with_person": "self._connection.connect_with_person(username, note=note)",
-    "extract_feed": "self._feed.extract_feed(num_posts)",
+    "extract_feed": "self._feed.extract_feed(num_posts, max_scrolls)",
     "extract_page": "self._capture.extract_page(url, section_name, max_scrolls)",
     "get_company_employees": "self._company.get_company_employees(company_name, keywords)",
     "get_conversation": "self._conversations.get_conversation(linkedin_username, thread_id, index)",
@@ -106,8 +110,8 @@ DELEGATE_CALLS = {
     "search_companies": "self._company.search_companies(keywords)",
     "search_conversations": "self._conversations.search_conversations(keywords, limit)",
     "archive_conversation": "self._conversations.archive_conversation(thread_id)",
-    "search_jobs": "self._jobs.search_jobs(keywords, location, max_pages, date_posted, job_type, experience_level, work_type, easy_apply, sort_by, tool_timeout)",
-    "search_people": "self._person.search_people(keywords, location=location, network=network, current_company=current_company)",
+    "search_jobs": "self._jobs.search_jobs(keywords, location, max_pages, date_posted, job_type, experience_level, work_type, easy_apply, sort_by, tool_timeout, start)",
+    "search_people": "self._person.search_people(keywords, location=location, network=network, current_company=current_company, connection_of=connection_of)",
     "search_posts": "self._posts.search_posts(keywords, date_posted=date_posted, max_pages=max_pages, content_type=content_type)",
     "send_message": "self._message_sender.send_message(linkedin_username, message, confirm_send=confirm_send, profile_urn=profile_urn)",
     "reply_to_conversation": "self._message_sender.reply_to_conversation(thread_id, message, confirm_send=confirm_send)",

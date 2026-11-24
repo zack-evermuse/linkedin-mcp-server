@@ -1,10 +1,34 @@
 import hashlib
 import os
 import sys
+import tempfile
 import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
+
+from hypothesis import HealthCheck, settings
+from hypothesis.configuration import set_hypothesis_home_dir
+
+set_hypothesis_home_dir(Path(tempfile.gettempdir()) / "linkedin-mcp-server-hypothesis")
+settings.register_profile(
+    "ci",
+    max_examples=100,
+    derandomize=True,
+    deadline=None,
+    database=None,
+    print_blob=True,
+    suppress_health_check=[HealthCheck.too_slow],
+)
+settings.register_profile(
+    "dev", max_examples=100, deadline=None, database=None, print_blob=True
+)
+settings.register_profile(
+    "thorough", parent=settings.get_profile("dev"), max_examples=2000
+)
+settings.load_profile(
+    os.environ.get("HYPOTHESIS_PROFILE") or ("ci" if os.environ.get("CI") else "dev")
+)
 
 # FastMCP 4 bridges camelCase reads on MCP SDK models (`result.isError`) with
 # deprecation shims that this switch turns off. The suite runs with them off,
@@ -36,9 +60,12 @@ def reset_singletons():
     from linkedin_mcp_server.logging_config import teardown_trace_logging
     from linkedin_mcp_server.drivers.browser import reset_browser_for_testing
     from linkedin_mcp_server.profile_lease import reset_leases_for_testing
+    from linkedin_mcp_server import login_relay, remote_catalog, remote_tools
     from linkedin_mcp_server.server_role import reset_process_role_for_testing
 
     reset_bootstrap_for_testing()
+    # Relay endpoints are process state like the login they serve.
+    login_relay.reset_for_testing()
     reset_daemon_descriptor_for_testing()
     # The owner's call tracker is process state like the rest. Left standing, a
     # call one test watched is still in flight for the next, which reads as an
@@ -57,6 +84,10 @@ def reset_singletons():
     # from process state. Left standing, one OWNER would refuse logins in every
     # test after it, in a suite where most never mention a role.
     reset_process_role_for_testing()
+    # A catalog request one test started, and the tools it installed, are
+    # process state: left standing, the next server installs nothing.
+    remote_catalog.reset_for_testing()
+    remote_tools.reset_for_testing()
     # The trace directory is derived from the profile root and cached, so a
     # test pointing USER_DATA_DIR at its tmp_path otherwise leaves every later
     # test on this worker writing into a directory pytest has removed. The log
@@ -68,6 +99,7 @@ def reset_singletons():
     reset_trace_state_for_testing()
     yield
     reset_bootstrap_for_testing()
+    login_relay.reset_for_testing()
     reset_daemon_descriptor_for_testing()
     reset_browser_for_testing()
     # After the browser, so a lease the browser still held is released by its
@@ -77,6 +109,8 @@ def reset_singletons():
     reset_throttle_record()
     reset_process_role_for_testing()
     reset_liveness_for_testing()
+    remote_catalog.reset_for_testing()
+    remote_tools.reset_for_testing()
     teardown_trace_logging(keep_traces=True)
     reset_trace_state_for_testing()
 
@@ -144,6 +178,10 @@ def ignore_the_developers_environment(monkeypatch):
     ours = [key for key in os.environ if key.startswith("LINKEDIN")]
     for key in (*from_the_table, *ours):
         monkeypatch.delenv(key, raising=False)
+    # A server any test starts, in-process or spawned, would otherwise ask the
+    # live catalog and list whatever it serves today. The catalog tests clear
+    # this and point the URL at a local stub instead.
+    monkeypatch.setenv("LINKEDIN_MCP_REMOTE_TOOLS", "off")
 
 
 @pytest.fixture(autouse=True)

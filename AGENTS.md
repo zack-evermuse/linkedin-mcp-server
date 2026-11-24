@@ -148,11 +148,12 @@ Optional additional keys:
 - `job_ids: [id, ...]` (search_jobs and get_saved_jobs)
 - `total: {count, exact}` (search_jobs only) — the result count LinkedIn advertises on the first page; `exact` is false for a lower bound such as "500+"
 - `promoted_job_ids: [id, ...]` (search_jobs only) — the subset of `job_ids` shown as promoted; present only when every page could be read, so an empty list means none were
-- `pagination: {pages_fetched, next_offset, reason}` (search_jobs only) — why paging stopped: `complete`, `max_pages`, `time_budget` or `no_new_ids`; `next_offset` is the `start` the next page would have used. Absent when a failure stopped the search, which `section_errors` then explains; a `filters_dropped` or `no_matching_jobs` entry is not a failure and keeps it
+- `pagination: {pages_fetched, next_offset, reason}` (search_jobs only) — why paging stopped: `complete`, `max_pages`, `time_budget` or `no_new_ids`; `next_offset` is the `start` the next page would have used, and passing it back as `start` with the same arguments continues the search. Absent when a failure stopped the search, which `section_errors` then explains; a `filters_dropped` or `no_matching_jobs` entry is not a failure and keeps it
 - `references["feed"]` (get_feed only) — every entry is `kind: "feed_post"`; non-post anchors (sidebar profiles, employer logos) are filtered. URLs may carry either `/feed/update/<urn>/` (DOM-anchor-derived) or `/posts/<slug>` (SDUI-derived) form; both are valid LinkedIn permalinks. An entry paired with a rendered post carries that post's URN as `value` and may carry `text` (an excerpt of the post); a post whose own markup does not name exactly one post URN is not paired, rather than given a guessed URL. Cap is 50 entries, matching `get_feed`'s `num_posts` ceiling.
 - `references["search_results"]` (search_posts only) — DOM references first, then up to 50 `kind: "feed_post"` permalinks read from the page's JSON/document payload responses (`/feed/update/<urn>/` or `/posts/<slug>`, both valid). Captured permalinks are appended, not aligned to result order.
 - `apply: {type, url?}` (get_job_apply_url, which returns no `sections`) — `type` is `easy_apply`, `external`, `applied`, `closed` or `unknown`; `url` is the employer's application link as LinkedIn gives it, never opened, present for external postings
 - `apply: {type}` (get_job_details) — `type` is `applied` or `closed`, read from the posting's text above its description without clicking; absent for an open posting and for one whose description heading was not captured
+- `time_zone: {id?, utc_offset}` (get_inbox, get_conversation and search_conversations, when they return text) — the zone the page renders message times in, read from the browser rather than set on it; `id` is the IANA name Chromium reports (possibly an older link, such as `Asia/Calcutta`), `utc_offset` is `+HH:MM` at the time of the read
 - `reply_to_conversation` returns no `sections`: `{url, status, message, recipient_selected, sent, retry_safe, thread_id, participant}`, the `send_message` fields plus the thread and the name its title shows (null when unread)
 - `archive_conversation` returns no `sections`: `{url, thread_id, participant, status}`, with `status` `archived` or `already_archived`; anything else raises
 - `dismiss_job` returns no `sections`: `{url, job_id, keywords, dismissed: true, already_dismissed}`, where `url` is the worldwide search for `keywords`, the title and company its posting names
@@ -227,14 +228,15 @@ section LinkedIn rate-limits, `send_message` takes three, and
 ```bash
 git checkout main && git pull
 uv version --bump minor          # or: major, patch — updates pyproject.toml AND uv.lock
+uv run scripts/prepare_release.py  # writes the version into the six derived files below
 uv run towncrier build --version "$(uv version --short)" --yes
 # optional: under the new version heading in docs/CHANGELOG.md, above the categories, add a `### Highlights` list of up to three `**Lead-in.** sentence ([#N](link))` bullets
-git add pyproject.toml uv.lock docs/CHANGELOG.md  # docs/CHANGELOG.md again, for the Highlights edit
+git add pyproject.toml uv.lock manifest.json docker-compose.yml .github/mcp/server.json plugins/linkedin-mcp-server/.codex-plugin/plugin.json plugins/linkedin-mcp-server/.claude-plugin/plugin.json plugins/linkedin-mcp-server/.cursor-plugin/plugin.json docs/CHANGELOG.md  # docs/CHANGELOG.md again, for the Highlights edit
 gt create -m "chore(release): Bump version to X.Y.Z"
 gt submit                        # merge PR to trigger release workflow
 ```
 
-The CI release workflow automatically updates `manifest.json`, `docker-compose.yml`, `.github/mcp/server.json` and the Codex, Claude Code, and Cursor plugin manifests under `plugins/linkedin-mcp-server/`. Do not update them manually.
+`scripts/prepare_release.py` writes the version from `pyproject.toml` into `manifest.json`, `docker-compose.yml`, `.github/mcp/server.json` and the Codex, Claude Code, and Cursor plugin manifests under `plugins/linkedin-mcp-server/`. The bump pull request carries those files, and the release publishes and tags the merged commit without committing anything. `prepare_release.py --check` runs in `lint-and-check` and again in the release workflow before anything is published, and fails on any of those files or `uv.lock` that disagrees with `pyproject.toml`.
 
 After the workflow completes, file a PR against
 [`docker/mcp-registry`](https://github.com/docker/mcp-registry) updating
@@ -297,13 +299,14 @@ Always read [`CONTRIBUTING.md`](.github/CONTRIBUTING.md) before filing an issue 
 - End PR bodies with `<Job> with <model> (<effort>) in <tool> via <host>.`
   Repeat `<job> with <model> (<effort>)` joined by `and` for each model that did a job.
   Example: `Implemented with Claude Opus 5.5 (xhigh) and reviewed with GPT-6 Pro (max) in Claude Code via T3 Code.`
-  Effort is the run's reasoning setting, or `effort unknown` if nothing states it. Humans are `Human`. Ask for other unknown values.
+  Effort is the run's reasoning setting. Read it for each model where the run reports it: the host's thread settings (T3 Code: `modelSelection`), launch flags, the environment (`$CLAUDE_EFFORT`), a subagent's definition or a delegate call. Humans are `Human`. Ask for other unknown values.
+  Write names as their makers do; an operating system is not a host.
   Keep attribution in that line: before pushing, amend agent `Co-authored-by` trailers out of your commits.
 - When implementing a new feature/fix:
   1. Packet: before filing or commenting on a GitHub issue, read [.agents/skills/issue-packet/SKILL.md](.agents/skills/issue-packet/SKILL.md).
   2. Branch from `main`: `feature/issue-number-short-description`
   3. Implement and test
-  4. Update README.md and docs/docker-hub.md if relevant
+  4. Update README.md and docs/docker-hub.md if relevant, with Before and After shots of each changed section ([docs/pr-media.md](docs/pr-media.md))
   5. Create a draft PR; only convert to regular PR when ready to merge. A `feat`, `fix` or breaking (`type!:`) PR then adds `changelog.d/<PR>.<type>.md`; see CONTRIBUTING
   6. Review with AI agents first, then manual review. PRs are squash-merged into `main` (one commit per PR), so keep the PR title as the conventional-commit subject; commits within a PR are for review only. The squash commit title is `<PR title> (#N)`, which an API or CLI merge sets explicitly.
 

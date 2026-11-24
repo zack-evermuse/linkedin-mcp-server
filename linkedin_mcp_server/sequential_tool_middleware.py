@@ -20,7 +20,9 @@ from linkedin_mcp_server.daemon.liveness import (
 )
 from linkedin_mcp_server.error_handler import CodedToolError, ErrorCode
 from linkedin_mcp_server.exceptions import BrowserBusyError
+from linkedin_mcp_server.login_view import LOGIN_VIEW_TOOLS
 from linkedin_mcp_server.profile_lease import get_profile_lease
+from linkedin_mcp_server.remote_tools import is_remote
 
 if TYPE_CHECKING:
     from linkedin_mcp_server.daemon.discovery import Unanswered
@@ -31,7 +33,8 @@ logger = logging.getLogger(__name__)
 #: lock and the profile lease, so they answer while another call holds the
 #: browser, and they are not browser activity, so asking does not keep an idle
 #: browser open. Only a tool whose body cannot reach Chromium belongs here:
-#: anything else would drive the profile unserialized.
+#: anything else would drive the profile unserialized. A tool from the remote
+#: catalog (`is_remote`) is treated the same way: its body is an HTTP request.
 _BROWSERLESS_TOOLS = frozenset({"get_session_status"})
 
 
@@ -81,7 +84,15 @@ class SequentialToolExecutionMiddleware(Middleware):
         call_next: CallNext[mt.CallToolRequestParams, ToolResult],
     ) -> ToolResult:
         tool_name = context.message.name
-        if tool_name in _BROWSERLESS_TOOLS:
+        # The sign-in view's tools reach only the browser a running login
+        # published (`login_view.published`), never the runtime browser, and
+        # that login holds the profile for its whole run. Serialized, every
+        # frame poll would queue behind a tool call and count as activity.
+        if (
+            tool_name in _BROWSERLESS_TOOLS
+            or tool_name in LOGIN_VIEW_TOOLS
+            or is_remote(tool_name)
+        ):
             return await call_next(context)
         wait_started = time.perf_counter()
         logger.debug("Waiting for browser lock for tool '%s'", tool_name)
